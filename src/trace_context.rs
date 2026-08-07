@@ -13,6 +13,13 @@ pub const TRACE_ID_BYTES: usize = 16;
 /// The number of bytes in a span id.
 pub const SPAN_ID_BYTES: usize = 8;
 
+/// The longest `traceparent` this crate will look at.
+///
+/// A version `00` header is 55 characters. The limit leaves room for the extra fields a
+/// future version may add and still bounds the work, because this value arrives in a
+/// client frame over a socket, and a socket frame has no field limit of its own.
+pub const MAX_TRACEPARENT_BYTES: usize = 256;
+
 /// A W3C trace id: 16 bytes, never all zero.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId([u8; TRACE_ID_BYTES]);
@@ -68,6 +75,14 @@ pub enum TraceContextError {
     /// Version `ff` is reserved and must be rejected rather than guessed at.
     #[error("traceparent version 'ff' is reserved")]
     ReservedVersion,
+    /// The header was longer than any valid `traceparent` can be.
+    #[error("traceparent is {found} bytes, over the {limit} byte limit")]
+    TooLong {
+        /// The most bytes this crate will look at.
+        limit: usize,
+        /// How many bytes arrived.
+        found: usize,
+    },
 }
 
 impl TraceId {
@@ -87,6 +102,41 @@ impl TraceId {
     /// This id as the 32 lowercase hexadecimal characters a `traceparent` carries.
     pub fn to_hex(self) -> String {
         to_hex(&self.0)
+    }
+
+    /// A fresh trace id, for when there is nothing to derive one from.
+    ///
+    /// The value only has to be unique enough that two unrelated turns do not share a
+    /// trace. It is not a secret and it is not cryptographically random, so nothing may
+    /// depend on it being unguessable.
+    pub fn generate() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Distinguishes two ids minted in the same nanosecond, and two processes started
+        /// in the same one.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        static SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_usize(std::process::id() as usize);
+            hasher.finish()
+        });
+
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos() as u64)
+            .unwrap_or(0);
+
+        let mut bytes = [0u8; TRACE_ID_BYTES];
+        bytes[..8].copy_from_slice(&(*SEED ^ nanos).to_be_bytes());
+        bytes[8..].copy_from_slice(&(counter.wrapping_add(nanos)).to_be_bytes());
+
+        // Every byte zero is the invalid sentinel, and this is the only way back from it.
+        if bytes == [0; TRACE_ID_BYTES] {
+            bytes[TRACE_ID_BYTES - 1] = 1;
+        }
+        Self(bytes)
     }
 
     /// The trace id these 32 hexadecimal characters spell.
@@ -222,12 +272,27 @@ pub fn trace_id_from_uuid(uuid_bytes: [u8; TRACE_ID_BYTES]) -> Result<TraceId, T
 /// Unknown future versions are accepted and their extra fields ignored, as the W3C spec
 /// requires. Version `ff` is reserved and is rejected.
 pub fn extract_traceparent(header: &str) -> Result<TraceParent, TraceContextError> {
-    let fields: Vec<&str> = header.trim().split('-').collect();
-    if fields.len() < 4 {
-        return Err(TraceContextError::FieldCount {
-            found: fields.len(),
+    // Length first, before anything is allocated from the input. A caller that can choose
+    // the header can otherwise choose how much memory this costs.
+    if header.len() > MAX_TRACEPARENT_BYTES {
+        return Err(TraceContextError::TooLong {
+            limit: MAX_TRACEPARENT_BYTES,
+            found: header.len(),
         });
     }
+
+    let header = header.trim();
+    // Only the four fields the spec defines are read. A future version may append more,
+    // and they are ignored rather than rejected.
+    let mut parts = header.splitn(5, '-');
+    let (Some(version), Some(trace_id), Some(span_id), Some(flags)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(TraceContextError::FieldCount {
+            found: header.split('-').count(),
+        });
+    };
+    let fields = [version, trace_id, span_id, flags];
 
     let version = fields[0];
     if version.len() != 2 || !version.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -267,12 +332,43 @@ pub fn inject_traceparent(parent: TraceParent) -> String {
     parent.to_header()
 }
 
-/// The trace to use for a turn.
+/// The trace to use for a turn. **This is the one to call.**
 ///
-/// An incoming `traceparent` wins. Only when none arrived, or the one that arrived cannot
-/// be parsed, does the request id become the trace id. Joining the caller's trace is the
-/// whole point of propagating it, so a malformed header must not silently start a second
-/// trace for work that is really one turn.
+/// An incoming `traceparent` wins. When none arrived, the request id becomes the trace id.
+/// When neither can be used, a fresh id is generated.
+///
+/// This never fails, and that is the point. Both inputs come from a client, and a client
+/// that sends a malformed header or a nil request id must not be able to stop the daemon
+/// doing the work. A discarded header is reported at WARN, so the information is visible
+/// without being fatal.
+///
+/// Use [`resolve_trace`] instead only where a malformed value should abort the caller.
+pub fn resolve_trace_or_mint(
+    incoming_traceparent: Option<&str>,
+    request_id: [u8; TRACE_ID_BYTES],
+) -> TraceOrigin {
+    if let Some(header) = incoming_traceparent {
+        match extract_traceparent(header) {
+            Ok(parent) => return TraceOrigin::Continued(parent),
+            Err(error) => tracing::warn!(
+                %error,
+                "discarding an unusable traceparent and starting a new trace"
+            ),
+        }
+    }
+
+    match TraceId::from_bytes(request_id) {
+        Ok(trace_id) => TraceOrigin::Minted(trace_id),
+        Err(_) => TraceOrigin::Minted(TraceId::generate()),
+    }
+}
+
+/// The trace to use for a turn, failing rather than falling back.
+///
+/// Prefer [`resolve_trace_or_mint`]. This variant returns an error when the incoming
+/// `traceparent` is malformed or the request id is all zero, which is right only where the
+/// caller controls both values and a bad one is a bug worth surfacing. On a path where a
+/// client supplies either of them, an error here fails a turn over input the client chose.
 pub fn resolve_trace(
     incoming_traceparent: Option<&str>,
     request_id: [u8; TRACE_ID_BYTES],

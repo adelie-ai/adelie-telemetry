@@ -34,6 +34,16 @@ pub const OVERFLOW_LABEL_VALUE: &str = "other";
 /// The label key that carries [`OVERFLOW_LABEL_VALUE`].
 pub const OVERFLOW_LABEL_KEY: &str = "cardinality";
 
+/// The most bytes a label value keeps.
+///
+/// The cardinality cap bounds how many series exist; this bounds what each one retains.
+/// Without it a metric with 64 values of a megabyte each holds 64 megabytes for the life
+/// of the process.
+pub const MAX_LABEL_VALUE_BYTES: usize = 128;
+
+/// What replaces a control character in a label value.
+const REPLACEMENT: char = '\u{fffd}';
+
 /// One dimension of a metric.
 ///
 /// Keys are `'static` because a metric's dimensions are a fixed vocabulary chosen at the
@@ -49,7 +59,7 @@ impl Label {
     pub fn new(key: &'static str, value: impl Into<String>) -> Self {
         Self {
             key,
-            value: value.into(),
+            value: sanitize(value.into()),
         }
     }
 
@@ -199,6 +209,17 @@ impl Registry {
         inner.clock = clock;
         inner.started_at = now;
         inner.last_dump_at = now;
+
+        // The window clock restarts here, so the window counts restart with it. Leaving
+        // them would report measurements taken before `init` as though they happened in
+        // the first window, which is the one an operator reads first. The running totals
+        // keep them.
+        for series in inner.counters.values_mut() {
+            series.window = 0;
+        }
+        for series in inner.histograms.values_mut() {
+            series.window.reset();
+        }
     }
 
     /// The settings in force.
@@ -210,7 +231,7 @@ impl Registry {
     pub fn add(&self, name: &'static str, value: u64, labels: &[Label]) {
         let resolved = {
             let mut inner = self.lock();
-            let key = inner.key_for(name, labels, Instrument::Counter);
+            let key = inner.key_for(name, labels);
             let series = inner.counters.entry(key.clone()).or_insert(CounterSeries {
                 total: 0,
                 window: 0,
@@ -237,7 +258,7 @@ impl Registry {
     pub fn record_duration(&self, name: &'static str, value: Duration, labels: &[Label]) {
         let resolved = {
             let mut inner = self.lock();
-            let key = inner.key_for(name, labels, Instrument::Histogram);
+            let key = inner.key_for(name, labels);
             let series = inner
                 .histograms
                 .entry(key.clone())
@@ -352,6 +373,40 @@ pub(crate) fn emit(summary: &Summary) {
     }
 }
 
+/// A label value that is safe to print and bounded in size.
+///
+/// A label value is not ours to trust. A remote MCP server names its own tools, and a
+/// model name can come from a config file somebody else wrote. The value reaches the
+/// console inside a log field, so a newline in it would produce what reads as a second
+/// genuine log line, with a real timestamp column, level and target. An ANSI escape would
+/// survive too: `with_ansi(false)` turns off the formatter's own colour, not escapes
+/// embedded in a field value.
+///
+/// Control characters are replaced rather than dropped, so the value still shows that
+/// something was there.
+fn sanitize(value: String) -> String {
+    let mut cleaned: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || character == '\u{7f}' {
+                REPLACEMENT
+            } else {
+                character
+            }
+        })
+        .collect();
+
+    if cleaned.len() > MAX_LABEL_VALUE_BYTES {
+        // Truncate on a character boundary. Cutting mid-character would panic.
+        let mut end = MAX_LABEL_VALUE_BYTES;
+        while end > 0 && !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned.truncate(end);
+    }
+    cleaned
+}
+
 /// Labels as one `key=value,key=value` string.
 fn render_labels(labels: &[Label]) -> String {
     labels
@@ -361,23 +416,10 @@ fn render_labels(labels: &[Label]) -> String {
         .join(",")
 }
 
-/// Which map a measurement belongs in. The cardinality cap counts a name's label sets
-/// once, so a counter and a histogram of the same name share one budget.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Instrument {
-    Counter,
-    Histogram,
-}
-
 impl Inner {
     /// The series key for this measurement, folding into the overflow series once the
     /// metric has as many label sets as the cap allows.
-    fn key_for(
-        &mut self,
-        name: &'static str,
-        labels: &[Label],
-        instrument: Instrument,
-    ) -> SeriesKey {
+    fn key_for(&mut self, name: &'static str, labels: &[Label]) -> SeriesKey {
         let mut sorted = labels.to_vec();
         // Sorted, so the order the call site wrote the labels in cannot split one series
         // into two.
@@ -389,10 +431,11 @@ impl Inner {
             labels: sorted,
         };
 
-        let known = match instrument {
-            Instrument::Counter => self.counters.contains_key(&candidate),
-            Instrument::Histogram => self.histograms.contains_key(&candidate),
-        };
+        // Checked against both maps, not just this instrument's. The budget is per metric
+        // name, so a label set used as a counter and as a histogram is one label set and
+        // must cost one slot.
+        let known =
+            self.counters.contains_key(&candidate) || self.histograms.contains_key(&candidate);
         if known {
             return candidate;
         }

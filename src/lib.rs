@@ -71,11 +71,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 pub use config::{Config, DEFAULT_FILTER};
 pub use guard::Guard;
-#[cfg(feature = "otel")]
-pub use otel::duration_bucket_boundaries as otel_duration_bucket_boundaries;
 pub use trace_context::{
     SpanId, TraceContextError, TraceId, TraceOrigin, TraceParent, extract_traceparent,
-    inject_traceparent, resolve_trace, trace_id_from_uuid,
+    inject_traceparent, resolve_trace, resolve_trace_or_mint, trace_id_from_uuid,
 };
 
 /// Why telemetry could not be installed.
@@ -98,6 +96,11 @@ pub enum Error {
 /// Always installs a console layer writing to **stderr**. Never stdout: the MCP stdio
 /// transport frames JSON-RPC there, and a stray log line corrupts the protocol stream.
 ///
+/// The console layer goes in whether or not the OTLP pipelines can be built. A collector
+/// that cannot be reached costs the process its export and nothing else: it keeps its
+/// console logging and its metrics summary, and the reason is written to the log at
+/// ERROR. A typo in one environment variable must not be able to silence a process.
+///
 /// With the `otel` feature on, the OTLP layers are added beside the console layer rather
 /// than in place of it, and are configured from the standard `OTEL_*` environment
 /// variables. With the feature off, the metrics registry still accumulates and still
@@ -118,22 +121,42 @@ pub fn init(config: Config) -> Result<Guard, Error> {
         config.clock(),
     );
 
+    // The OTLP side is built before the subscriber, because its layers have to go in
+    // beside the console layer and layers cannot be added afterwards. A failure is
+    // carried, not returned: the console layer and the metrics summary must survive a
+    // collector that could not be reached, and they are what an operator falls back on
+    // when it cannot. The error is reported once the console exists to report it on.
     #[cfg(feature = "otel")]
-    let pipelines = otel::Pipelines::build(&config)?;
+    let (pipelines, pipeline_error) = match otel::Pipelines::build(&config) {
+        Ok(pipelines) => (Some(pipelines), None),
+        Err(error) => (None, Some(error)),
+    };
 
     let subscriber = tracing_subscriber::registry()
         .with(console::env_filter(&config))
         .with(console::console_layer(&config, std::io::stderr));
 
     #[cfg(feature = "otel")]
-    let subscriber = subscriber.with(pipelines.layers());
+    let subscriber = subscriber.with(pipelines.as_ref().map(otel::Pipelines::layers));
 
     // A foreign subscriber may already be installed, in which case this process is not
     // ours to configure. Take nothing over, and hand back a guard that owns nothing.
     if subscriber.try_init().is_err() {
         #[cfg(feature = "otel")]
-        pipelines.shutdown();
+        if let Some(pipelines) = pipelines {
+            pipelines.shutdown(config.shutdown_budget());
+        }
         return Ok(Guard::inert());
+    }
+
+    #[cfg(feature = "otel")]
+    if let Some(error) = pipeline_error {
+        tracing::error!(
+            %error,
+            configuration = %otel::configuration_summary(),
+            "telemetry export is off for this process; console logging and the metrics \
+             summary are unaffected"
+        );
     }
 
     let dump = guard::DumpThread::spawn(config.metrics_dump_interval());
@@ -141,6 +164,8 @@ pub fn init(config: Config) -> Result<Guard, Error> {
     Ok(Guard::new(
         dump,
         #[cfg(feature = "otel")]
-        Some(pipelines),
+        pipelines,
+        #[cfg(feature = "otel")]
+        config.shutdown_budget(),
     ))
 }

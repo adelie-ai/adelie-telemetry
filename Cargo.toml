@@ -17,7 +17,22 @@ otel = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-appender-tracing",
+    "dep:tokio",
+    "otel-tls",
 ]
+
+# The TLS backend, kept as its own feature so the code can ask whether it is there.
+# `otel` always turns it on, so every shipped build can reach an https collector. It
+# costs a C toolchain and cmake at build time, because rustls pulls aws-lc-rs.
+otel-tls = [
+    "opentelemetry-otlp/tls-webpki-roots",
+    "opentelemetry-otlp/reqwest-rustls-webpki-roots",
+]
+
+# Internal. Adds the SDK's in-memory exporter so a test can read back what the OTLP
+# path actually produced, instead of asserting a constant against itself. `just
+# check-otel` turns it on; nothing shipped depends on it.
+otel-testing = ["otel", "opentelemetry_sdk/testing"]
 
 [dependencies]
 thiserror = "2.0.19"
@@ -31,12 +46,23 @@ tracing-opentelemetry = { version = "0.33.0", optional = true }
 
 opentelemetry_sdk = { version = "0.32.1", optional = true }
 
+# `rt` only, to ask whether a Tokio runtime is running. The gRPC transport needs one
+# and panics from inside hyper without it, so the question has to be asked before the
+# exporter is built. `grpc-tonic` already pulls tokio in, so this adds no crate.
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt",
+], optional = true }
+
 # Both transports are compiled in so that OTEL_EXPORTER_OTLP_PROTOCOL selects
 # one at run time. `http-proto` reaches a collector on 4318 and `grpc-tonic`
 # reaches one on 4317. The exporter builders only consult the variable when
 # neither transport was chosen in code, and a transport that is not compiled in
 # cannot be selected at all, so compiling one would make the documented variable
 # a lie for half its values.
+#
+# TLS comes from the `otel-tls` feature rather than from here, so the code can tell
+# whether a TLS backend is compiled in. Publicly trusted roots only; a private CA would
+# need `tls-roots` instead.
 opentelemetry-otlp = { version = "0.32.0", features = [
     "grpc-tonic",
 ], optional = true }

@@ -25,6 +25,8 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::Instrument;
 use opentelemetry_sdk::metrics::{Aggregation, InstrumentKind, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use std::time::Duration;
+
 use tracing::Level;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::filter_fn;
@@ -33,11 +35,18 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::config::Config;
 use crate::metrics::DURATION_BUCKETS_MS;
 
+mod preflight;
+
+/// The OTLP variables that are set, for a failure report. Header values are withheld.
+pub(crate) fn configuration_summary() -> String {
+    preflight::configuration_summary()
+}
+
 /// The bucket boundaries the OTLP view is built from.
 ///
 /// The in-process registry reports the same values, so a measurement falls in the same
 /// bucket whichever path reads it.
-pub fn duration_bucket_boundaries() -> Vec<f64> {
+fn duration_bucket_boundaries() -> Vec<f64> {
     DURATION_BUCKETS_MS.to_vec()
 }
 
@@ -56,6 +65,11 @@ impl Pipelines {
             .with_service_name(config.service_name().to_owned())
             .build();
 
+        preflight::check(
+            "traces",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        )?;
         let span_exporter = SpanExporter::builder()
             .build()
             .map_err(|error| pipeline_error("traces", &error))?;
@@ -64,6 +78,11 @@ impl Pipelines {
             .with_batch_exporter(span_exporter)
             .build();
 
+        preflight::check(
+            "metrics",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        )?;
         let metric_exporter = MetricExporter::builder()
             .build()
             .map_err(|error| pipeline_error("metrics", &error))?;
@@ -73,6 +92,11 @@ impl Pipelines {
             .with_view(duration_view)
             .build();
 
+        preflight::check(
+            "logs",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        )?;
         let log_exporter = LogExporter::builder()
             .build()
             .map_err(|error| pipeline_error("logs", &error))?;
@@ -131,16 +155,63 @@ impl Pipelines {
         vec![Box::new(trace_layer), Box::new(log_layer)]
     }
 
-    /// Flush and shut down all three pipelines, in the order traces, metrics, logs.
-    pub(crate) fn shutdown(&self) {
-        // A failure here is reported and then dropped. The process is on its way out, and
-        // there is nowhere left to propagate to.
-        report("traces", "flush", self.traces.force_flush());
-        report("traces", "shutdown", self.traces.shutdown());
-        report("metrics", "flush", self.metrics.force_flush());
-        report("metrics", "shutdown", self.metrics.shutdown());
-        report("logs", "flush", self.logs.force_flush());
-        report("logs", "shutdown", self.logs.shutdown());
+    /// Flush and shut down all three pipelines, in the order traces, metrics, logs,
+    /// within `budget`.
+    ///
+    /// Why a budget: each provider's flush and shutdown blocks for up to five seconds
+    /// against an unreachable collector, and there are six calls. Thirty seconds in `Drop`
+    /// is longer than the thirty-second `terminationGracePeriodSeconds` Kubernetes
+    /// defaults to, so the pod is killed part way through shutdown, which is the failure
+    /// this telemetry exists to make visible.
+    ///
+    /// The work runs on its own thread so the budget can be enforced. A thread that
+    /// overruns is left running; the process is exiting, and an exporter that will not
+    /// stop must not decide when.
+    pub(crate) fn shutdown(&self, budget: Duration) {
+        let traces = self.traces.clone();
+        let metrics = self.metrics.clone();
+        let logs = self.logs.clone();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("adelie-telemetry-shutdown".to_owned())
+            .spawn(move || {
+                // A failure here is reported and then dropped. The process is on its way
+                // out, and there is nowhere left to propagate to.
+                report("traces", "flush", traces.force_flush());
+                report("traces", "shutdown", traces.shutdown_with_timeout(budget));
+                report("metrics", "flush", metrics.force_flush());
+                report("metrics", "shutdown", metrics.shutdown_with_timeout(budget));
+                report("logs", "flush", logs.force_flush());
+                report("logs", "shutdown", logs.shutdown_with_timeout(budget));
+                let _ = done.send(());
+            });
+
+        match spawned {
+            Ok(_handle) => {
+                if finished.recv_timeout(budget).is_err() {
+                    tracing::warn!(
+                        budget_seconds = budget.as_secs(),
+                        "the OTLP pipelines did not shut down within their budget; \
+                         buffered telemetry may be lost"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not start the shutdown thread; flushing inline");
+                report(
+                    "traces",
+                    "shutdown",
+                    self.traces.shutdown_with_timeout(budget),
+                );
+                report(
+                    "metrics",
+                    "shutdown",
+                    self.metrics.shutdown_with_timeout(budget),
+                );
+                report("logs", "shutdown", self.logs.shutdown_with_timeout(budget));
+            }
+        }
     }
 }
 
@@ -202,9 +273,72 @@ mod tests {
         );
     }
 
-    /// The OTLP view is built from the same constant the in-process registry uses.
+    /// The exported histogram must carry the shared bucket boundaries.
+    ///
+    /// Read back off a real export rather than compared against the constant the view was
+    /// built from. Asserting the constant equals itself passes even when the view matches
+    /// no instrument at all and every histogram silently falls back to the SDK defaults.
+    #[cfg(feature = "otel-testing")]
     #[test]
-    fn otlp_view_uses_the_shared_bucket_boundaries() {
-        assert_eq!(duration_bucket_boundaries(), DURATION_BUCKETS_MS.to_vec());
+    fn otlp_export_carries_the_shared_bucket_boundaries() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(duration_view)
+            .build();
+
+        // Built through the same function the facade builds its instruments with, so the
+        // test sees whatever the bridge would really produce.
+        let histogram = crate::metrics::otel_bridge::build_duration_histogram(
+            &provider.meter("test"),
+            "probe.latency",
+        );
+        histogram.record(320.0, &[KeyValue::new("provider", "example")]);
+
+        provider.force_flush().expect("the reader must flush");
+
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("metrics must export");
+        let histogram = exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "probe.latency")
+            .expect("the histogram must be exported");
+
+        let AggregatedMetrics::F64(MetricData::Histogram(data)) = histogram.data() else {
+            panic!("a duration histogram must export as an f64 histogram");
+        };
+        let point = data
+            .data_points()
+            .next()
+            .expect("one measurement was recorded");
+
+        assert_eq!(
+            point.bounds().collect::<Vec<f64>>(),
+            DURATION_BUCKETS_MS.to_vec(),
+            "the OTLP export must use the shared boundaries, or the two paths disagree \
+             about which bucket a measurement fell in"
+        );
+        assert_eq!(point.count(), 1);
+    }
+
+    /// The view must select the instruments the facade creates.
+    ///
+    /// It matches on kind and unit, so a change to either in the bridge silently unhooks
+    /// every histogram from the shared boundaries.
+    #[test]
+    fn the_bridge_creates_instruments_the_view_selects() {
+        assert_eq!(
+            crate::metrics::otel_bridge::DURATION_UNIT,
+            "ms",
+            "the view matches on this unit; changing it detaches the shared boundaries"
+        );
     }
 }

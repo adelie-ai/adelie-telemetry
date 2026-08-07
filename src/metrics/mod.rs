@@ -34,7 +34,7 @@ use std::time::Duration;
 pub use histogram::{Bucket, DURATION_BUCKETS_MS, HistogramSnapshot};
 pub use registry::{
     CounterSummary, DEFAULT_CARDINALITY_CAP, DEFAULT_DUMP_INTERVAL, HistogramSummary, Label,
-    OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE, Registry, Settings, Summary,
+    MAX_LABEL_VALUE_BYTES, OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE, Registry, Settings, Summary,
 };
 
 /// The registry the free functions in this module record into.

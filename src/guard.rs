@@ -21,6 +21,8 @@ pub struct Guard {
     dump: Option<DumpThread>,
     #[cfg(feature = "otel")]
     pipelines: Option<crate::otel::Pipelines>,
+    #[cfg(feature = "otel")]
+    shutdown_budget: Duration,
 }
 
 impl Guard {
@@ -30,6 +32,8 @@ impl Guard {
             dump: None,
             #[cfg(feature = "otel")]
             pipelines: None,
+            #[cfg(feature = "otel")]
+            shutdown_budget: Duration::ZERO,
         }
     }
 
@@ -38,11 +42,14 @@ impl Guard {
     pub(crate) fn new(
         dump: Option<DumpThread>,
         #[cfg(feature = "otel")] pipelines: Option<crate::otel::Pipelines>,
+        #[cfg(feature = "otel")] shutdown_budget: Duration,
     ) -> Self {
         Self {
             dump,
             #[cfg(feature = "otel")]
             pipelines,
+            #[cfg(feature = "otel")]
+            shutdown_budget,
         }
     }
 }
@@ -55,7 +62,7 @@ impl Drop for Guard {
 
         #[cfg(feature = "otel")]
         if let Some(pipelines) = self.pipelines.take() {
-            pipelines.shutdown();
+            pipelines.shutdown(self.shutdown_budget);
         }
     }
 }
@@ -86,10 +93,21 @@ impl DumpThread {
 
         let stop = Arc::new(Stop::default());
         let worker_stop = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("adelie-telemetry-metrics".to_owned())
             .spawn(move || run(&worker_stop, interval))
-            .ok()?;
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                // Silence here would remove both the periodic summary and the final dump
+                // at shutdown, and nothing else would ever say why the numbers stopped.
+                tracing::warn!(
+                    %error,
+                    "could not start the metrics thread; no periodic summary will be written"
+                );
+                return None;
+            }
+        };
 
         Some(Self {
             stop,

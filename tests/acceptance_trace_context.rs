@@ -191,3 +191,88 @@ fn traceparent_rejects_malformed_fields() {
         Err(TraceContextError::FieldCount { found: 2 })
     );
 }
+
+/// An invalid client-supplied value must never fail a turn.
+///
+/// `desktop-assistant#1152` carries this criterion. A client controls both the
+/// `traceparent` and the request id, so a strict call would let malformed input from a
+/// client abort work the daemon should still do.
+#[test]
+fn malformed_or_nil_client_id_falls_back_to_minting() {
+    let minted = trace_context::resolve_trace_or_mint(Some("not-a-traceparent"), REQUEST_ID);
+    assert_eq!(
+        minted.trace_id().to_bytes(),
+        REQUEST_ID,
+        "a malformed header must fall back to the request id, not fail the turn"
+    );
+
+    let nil_id = trace_context::resolve_trace_or_mint(Some("also-junk"), [0; 16]);
+    assert_ne!(
+        nil_id.trace_id().to_bytes(),
+        [0; 16],
+        "a nil request id must still produce a usable trace id"
+    );
+
+    let nothing = trace_context::resolve_trace_or_mint(None, [0; 16]);
+    assert_ne!(nothing.trace_id().to_bytes(), [0; 16]);
+
+    // A valid header still wins over the request id.
+    let continued = trace_context::resolve_trace_or_mint(
+        Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+        REQUEST_ID,
+    );
+    assert_eq!(
+        continued.trace_id().to_hex(),
+        "0af7651916cd43dd8448eb211c80319c"
+    );
+}
+
+/// Two minted fallbacks must not collide, or unrelated turns would share a trace.
+#[test]
+fn minted_fallback_ids_are_distinct() {
+    let first = trace_context::resolve_trace_or_mint(None, [0; 16]).trace_id();
+    let second = trace_context::resolve_trace_or_mint(None, [0; 16]).trace_id();
+    assert_ne!(first, second);
+}
+
+/// An oversized header is rejected on its length, before anything is allocated from it.
+///
+/// Under `desktop-assistant#1152` this value arrives in a client frame over UDS, a
+/// WebSocket or D-Bus. None of those caps the field the way an HTTP header does.
+#[test]
+fn extract_traceparent_rejects_an_oversized_header() {
+    let huge = "-".repeat(32 * 1024 * 1024);
+
+    let started = std::time::Instant::now();
+    let result = trace_context::extract_traceparent(&huge);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        result,
+        Err(TraceContextError::TooLong {
+            limit: trace_context::MAX_TRACEPARENT_BYTES,
+            found: huge.len(),
+        })
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "rejection must be on length alone, so it cannot be made expensive; took {elapsed:?}"
+    );
+}
+
+/// A header at the documented limit is still accepted.
+#[test]
+fn extract_traceparent_accepts_a_header_at_the_limit() {
+    let base = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    assert!(base.len() <= trace_context::MAX_TRACEPARENT_BYTES);
+
+    let padded = format!(
+        "{base}{}",
+        "-x".repeat((trace_context::MAX_TRACEPARENT_BYTES - base.len()) / 2)
+    );
+    assert!(padded.len() <= trace_context::MAX_TRACEPARENT_BYTES);
+    assert!(
+        trace_context::extract_traceparent(&padded).is_ok(),
+        "trailing fields of a future version must not be rejected by the length bound"
+    );
+}

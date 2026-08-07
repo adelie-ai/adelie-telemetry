@@ -192,13 +192,6 @@ fn histogram_buckets_match_otlp_export() {
         "the in-process dump must report the shared boundaries, ending in the overflow bucket"
     );
     assert_eq!(histogram.window.bounds(), expected);
-
-    #[cfg(feature = "otel")]
-    assert_eq!(
-        adelie_telemetry::otel_duration_bucket_boundaries(),
-        DURATION_BUCKETS_MS.to_vec(),
-        "the OTLP view must be configured from the same constant, or the two paths disagree"
-    );
 }
 
 /// A measurement lands in the bucket its value belongs to, and the tail is not lost.
@@ -321,4 +314,118 @@ fn reconfigure_keeps_existing_measurements() {
 
     clock.advance(Duration::from_secs(60));
     assert!(registry.dump_if_due().is_some(), "the new interval applies");
+}
+
+/// A label value can never forge a log line.
+///
+/// The value reaches the console inside a field. A newline in it would produce what reads
+/// as a second genuine line, with a real timestamp column, level and target. A remote MCP
+/// server names its own tools, so this value is not ours to trust.
+#[test]
+fn label_value_cannot_forge_a_log_line() {
+    let hostile = "search\n2026-08-07T00:00:00Z ERROR adele_daemon: database wiped";
+    let label = Label::new("tool", hostile);
+
+    assert!(
+        !label.value().contains('\n'),
+        "a newline in a label value would start a forged log line: {:?}",
+        label.value()
+    );
+    assert!(!label.value().contains('\r'));
+    assert!(
+        !label.value().contains('\u{1b}'),
+        "an ANSI escape survives with_ansi(false), which only disables the formatter's own colour"
+    );
+
+    // The readable part is kept, so sanitising does not destroy the diagnostic.
+    assert!(label.value().starts_with("search"));
+}
+
+/// A label value cannot grow the registry without bound.
+///
+/// The cardinality cap bounds the number of series, not the bytes each one retains.
+#[test]
+fn label_value_is_truncated() {
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let label = Label::new("model", huge);
+
+    assert!(
+        label.value().len() <= adelie_telemetry::metrics::MAX_LABEL_VALUE_BYTES,
+        "retained bytes must be bounded, found {}",
+        label.value().len()
+    );
+}
+
+/// Truncation must not split a character in half.
+#[test]
+fn label_value_truncation_respects_character_boundaries() {
+    let wide = "\u{1f600}".repeat(4 * 1024 * 1024);
+    let label = Label::new("model", wide);
+    assert!(label.value().len() <= adelie_telemetry::metrics::MAX_LABEL_VALUE_BYTES);
+    assert!(
+        label
+            .value()
+            .chars()
+            .all(|character| character == '\u{1f600}')
+    );
+}
+
+/// One label set costs one slot, whether it is used as a counter, a histogram or both.
+#[test]
+fn cardinality_cap_counts_a_label_set_once_across_instruments() {
+    let cap = 4;
+    let (registry, _clock) = registry(Duration::from_secs(600), cap);
+
+    for index in 0..cap {
+        let labels = [Label::new("tool", format!("tool-{index}"))];
+        registry.increment("tool.calls", &labels);
+        registry.record_duration("tool.calls", Duration::from_millis(10), &labels);
+    }
+
+    // Four label sets, each used twice. That is four slots, not eight, so a fifth still
+    // fits under a cap of four... and the fifth is what proves the budget was not spent.
+    assert_eq!(
+        registry.series_count(),
+        cap * 2,
+        "each of the {cap} label sets should hold one counter series and one histogram series"
+    );
+
+    let summary = registry.snapshot();
+    assert!(
+        !summary.counters.iter().any(|counter| counter
+            .labels
+            .iter()
+            .any(|label| label.key() == OVERFLOW_LABEL_KEY)),
+        "no label set should have overflowed: the budget was spent twice per label set"
+    );
+}
+
+/// Reconfiguring starts a fresh window, so the first delta is not inflated by history.
+#[test]
+fn reconfigure_starts_a_fresh_window() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    registry.add("early.metric", 40, &[]);
+
+    let clock = Arc::new(ManualClock::new());
+    registry.reconfigure(
+        Settings {
+            dump_interval: Duration::from_secs(60),
+            cardinality_cap: 64,
+        },
+        Arc::clone(&clock) as Arc<dyn adelie_telemetry::clock::Clock>,
+    );
+
+    registry.add("early.metric", 2, &[]);
+    clock.advance(Duration::from_secs(60));
+    let summary = registry.dump_if_due().expect("the window is due");
+
+    let counter = &summary.counters[0];
+    assert_eq!(
+        counter.window_delta, 2,
+        "the window clock restarts at reconfigure, so the window count must restart with it"
+    );
+    assert_eq!(
+        counter.total, 42,
+        "the running total still carries what was recorded before init"
+    );
 }

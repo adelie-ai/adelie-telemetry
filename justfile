@@ -27,8 +27,10 @@ lint-otel:
     cargo clippy --all-targets --features otel -- -D warnings
 build-otel:
     cargo build --features otel
+# `otel-testing` adds the SDK in-memory exporter the histogram-bucket test reads back
+# from. It is a superset of `otel`, so this covers the shipped configuration too.
 test-otel:
-    cargo test --features otel
+    cargo test --features otel-testing
 
 # Both configurations. This is what the pre-push hook runs.
 check-all: check check-otel

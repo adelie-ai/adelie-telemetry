@@ -62,8 +62,21 @@ pub(crate) fn record_duration_ms(name: &'static str, millis: f64, labels: &[Labe
     let mut cache = lock(histograms());
     let histogram = cache
         .entry(name)
-        .or_insert_with(|| meter().f64_histogram(name).with_unit(DURATION_UNIT).build());
+        .or_insert_with(|| build_duration_histogram(&meter(), name));
     histogram.record(millis, &attributes);
+}
+
+/// Build a duration histogram the OTLP view will select.
+///
+/// The view matches on instrument kind and unit, so the unit set here is what attaches
+/// the shared bucket boundaries. Every duration histogram is built through this one
+/// function, and a test builds its instrument the same way, so dropping the unit fails
+/// that test instead of silently moving every histogram onto the SDK's default buckets.
+pub(crate) fn build_duration_histogram(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+) -> Histogram<f64> {
+    meter.f64_histogram(name).with_unit(DURATION_UNIT).build()
 }
 
 fn meter() -> opentelemetry::metrics::Meter {

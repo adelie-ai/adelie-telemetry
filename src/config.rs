@@ -9,6 +9,13 @@ use crate::metrics::{DEFAULT_CARDINALITY_CAP, DEFAULT_DUMP_INTERVAL};
 /// The filter used when neither `RUST_LOG` nor the caller says otherwise.
 pub const DEFAULT_FILTER: &str = "info";
 
+/// How long the shutdown guard may spend flushing before it gives up.
+///
+/// Kubernetes defaults `terminationGracePeriodSeconds` to 30. A shutdown that overruns it
+/// is killed part way through, so the budget has to leave the rest of the process room to
+/// stop as well.
+pub const DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
 /// How a binary configures its telemetry.
 ///
 /// Everything past the service name has a working default, so the common case is
@@ -22,6 +29,7 @@ pub struct Config {
     metrics_dump_interval: Duration,
     cardinality_cap: usize,
     span_close_events: bool,
+    shutdown_budget: Duration,
     clock: Arc<dyn Clock>,
 }
 
@@ -37,6 +45,7 @@ impl Config {
             metrics_dump_interval: DEFAULT_DUMP_INTERVAL,
             cardinality_cap: DEFAULT_CARDINALITY_CAP,
             span_close_events: false,
+            shutdown_budget: DEFAULT_SHUTDOWN_BUDGET,
             clock: Arc::new(SystemClock::new()),
         }
     }
@@ -71,6 +80,15 @@ impl Config {
         self
     }
 
+    /// Spend at most this long flushing telemetry when the guard drops.
+    ///
+    /// Raise it where losing buffered telemetry matters more than stopping quickly, and
+    /// keep it below the termination grace period of whatever runs the process.
+    pub fn with_shutdown_budget(mut self, budget: Duration) -> Self {
+        self.shutdown_budget = budget;
+        self
+    }
+
     /// Measure time with this clock instead of the platform monotonic clock.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -100,6 +118,11 @@ impl Config {
     /// Whether a closing span writes a line.
     pub fn span_close_events(&self) -> bool {
         self.span_close_events
+    }
+
+    /// How long the guard may spend flushing.
+    pub fn shutdown_budget(&self) -> Duration {
+        self.shutdown_budget
     }
 
     /// The clock in use.

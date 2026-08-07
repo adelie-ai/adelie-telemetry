@@ -41,6 +41,62 @@ Anything outside that list belongs to the binary that needs it.
 adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry" }
 ```
 
+### Passing the feature through
+
+A crate that is itself a dependency must re-export the feature, or the binary at the top
+has no way to turn export on. Without this line the build still succeeds and the process
+exports nothing, which is the failure that is hardest to notice.
+
+```toml
+[features]
+otel = ["adelie-telemetry/otel"]
+```
+
+Every crate on the path needs it, so an MCP server reaches the crate through two hops:
+
+```toml
+# some-mcp/Cargo.toml
+[features]
+otel = ["mcp-core/otel"]
+
+# mcp-core/Cargo.toml
+[features]
+otel = ["adelie-telemetry/otel"]
+```
+
+Then `cargo build --features otel` on the server turns all three on. A leaf binary that
+depends on this crate directly writes `features = ["otel"]` on the dependency instead.
+
+### Replacing an existing subscriber
+
+The usual starting point:
+
+```rust
+tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    )
+    .init();
+```
+
+becomes:
+
+```rust
+let _guard = adelie_telemetry::init(adelie_telemetry::Config::new("adele-daemon"))?;
+```
+
+Four things to check while replacing one:
+
+1. **Bind the guard.** `let _guard = ...`, not `let _ = ...`. A `_` binding drops it
+   immediately and the process exits without flushing. Keep it alive for all of `main`.
+2. **Keep the old default filter.** A binary that was quiet unless asked passes its old
+   fallback to `Config::with_default_filter`, or it starts logging at `info` where it used
+   to say nothing.
+3. **Drop any `with_writer` pointing at stdout.** This crate always writes to stderr.
+4. **Remove `.init()` calls in libraries.** Only the binary installs a subscriber. A second
+   call is a no-op, so a stale one hides itself rather than failing.
+
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = adelie_telemetry::init(adelie_telemetry::Config::new("adele-daemon"))?;
@@ -258,8 +314,13 @@ so `init` must be reached from inside a running runtime. Every Adelie daemon is 
 binary, so this holds in practice, but a small tool that calls `init` before starting a
 runtime must use the HTTP transport.
 
-Neither transport is compiled with a TLS backend, so an `https` endpoint is not supported
-yet. In-cluster collectors are reached over plaintext on the node-local network.
+Both transports support `https`, using the platform's publicly trusted roots. A collector
+behind a reverse proxy with a normal certificate needs no extra configuration. A private
+certificate authority is not trusted; that would need the `tls-roots` feature instead.
+
+**Build prerequisite:** `--features otel` needs `cmake` and a C compiler, because the TLS
+stack builds `aws-lc-rs` from source. A default-feature build needs neither, so a desktop
+install from `cargo install` is unaffected.
 
 ### Which pipeline owns an event
 
@@ -276,6 +337,16 @@ The one exception is `ERROR`. The trace layer sets a span's status to failed whe
 error event, and that status is what stops a failed turn looking green in a trace view.
 Error events therefore reach both, and are the only events that appear twice.
 
+### When a pipeline cannot be built
+
+A wrong value in the environment costs the process its export and nothing else. The console
+layer is installed either way, the metrics summary keeps running, and the reason is written
+at ERROR together with the `OTEL_*` variables that were set. Header values are never
+printed, because they routinely carry an API key.
+
+A binary that would rather not start at all can read the same condition from its own log
+and exit; `init` itself returns `Ok` so that a typo cannot silence a process.
+
 ### Shutdown
 
 `init` returns a `Guard`. Dropping it flushes and shuts down traces, metrics and logs, in
@@ -283,14 +354,26 @@ that order, and writes one final metrics summary. The batch exporters buffer, an
 that exits without a flush loses whatever was still in the buffer, which is usually the part
 worth having, because a crash is what was being investigated.
 
+Shutdown is bounded. Each provider can block for about five seconds against an unreachable
+collector, and there are six calls, so an unbounded drop can run for thirty seconds.
+`Config::with_shutdown_budget` caps the total, and the default is five seconds.
+
+**Kubernetes:** set `terminationGracePeriodSeconds` to at least 30 in any deployment that
+runs with `otel` on. The default is 30, and the pod needs room to flush telemetry *and*
+finish whatever else it was doing before SIGKILL arrives.
+
 ## Development
 
 ```sh
 just check       # format, clippy, build, test, and the no-opentelemetry check
-just check-otel  # the same build and tests with --features otel
+just check-otel  # the same build and tests with the otel feature on
 just check-all   # both. This is what the pre-push hook runs.
 just install-hooks
 ```
+
+`check-otel` builds with `otel-testing`, which adds the SDK's in-memory exporter so a test
+can read back what the OTLP path really produced. It is a superset of `otel`, so the
+shipped configuration is covered by the same run.
 
 Both configurations are part of the gate. A change that compiles with default features can
 still fail with `otel` on.
