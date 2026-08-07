@@ -22,7 +22,7 @@ test:
 
 # The gate for the `otel` feature set. The crate ships two configurations, so
 # both must pass before a push.
-check-otel: lint-otel build-otel test-otel
+check-otel: lint-otel build-otel test-otel no-bundled-roots
 lint-otel:
     cargo clippy --all-targets --features otel -- -D warnings
 build-otel:
@@ -53,6 +53,10 @@ no-otel-default:
 # constrain a dependent, so it hides exactly this class of fault.
 consumer-resolves:
     ./scripts/consumer-resolves.sh
+
+# Neither transport may bundle a certificate root set into the binary.
+no-bundled-roots:
+    ./scripts/no-bundled-roots.sh
 
 premerge:
     git fetch origin
