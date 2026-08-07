@@ -64,6 +64,7 @@ mod guard;
 pub mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
+mod safe;
 pub mod trace_context;
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -71,6 +72,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 pub use config::{Config, DEFAULT_FILTER};
 pub use guard::Guard;
+pub use safe::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES, REPLACEMENT, Safe, TRUNCATED};
 pub use trace_context::{
     SpanId, TraceContextError, TraceId, TraceOrigin, TraceParent, extract_traceparent,
     inject_traceparent, resolve_trace, resolve_trace_or_mint, trace_id_from_uuid,

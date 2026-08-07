@@ -57,7 +57,10 @@ fn safe_strips_every_deceptive_character() {
             "U+{:04X} {name} survived: {rendered:?}",
             *character as u32
         );
-        assert!(rendered.starts_with("before"), "the readable part must survive");
+        assert!(
+            rendered.starts_with("before"),
+            "the readable part must survive"
+        );
         assert!(rendered.ends_with("after"), "and so must what follows it");
     }
 }
@@ -100,10 +103,9 @@ fn safe_and_label_agree_character_for_character() {
 /// A name is capped tighter than a message, and the difference is deliberate.
 #[test]
 fn a_name_is_capped_tighter_than_a_message() {
-    assert!(
-        MAX_NAME_BYTES < MAX_MESSAGE_BYTES,
-        "a name is short by nature and a message is not"
-    );
+    // Checked when the test compiles, so reversing the two caps breaks the build rather
+    // than waiting for a run.
+    const { assert!(MAX_NAME_BYTES < MAX_MESSAGE_BYTES) };
 
     let long = "x".repeat(MAX_MESSAGE_BYTES * 2);
     assert!(Safe::name(&long).to_string().len() <= MAX_NAME_BYTES + "...".len());
@@ -133,7 +135,10 @@ fn truncation_respects_character_boundaries() {
     let wide = "\u{1f600}".repeat(MAX_NAME_BYTES);
     let rendered = Safe::name(&wide).to_string();
     assert!(
-        rendered.trim_end_matches('.').chars().all(|c| c == '\u{1f600}'),
+        rendered
+            .trim_end_matches('.')
+            .chars()
+            .all(|c| c == '\u{1f600}'),
         "a cut mid-character would produce a replacement that was never in the input"
     );
 }
@@ -180,7 +185,10 @@ fn nothing_renders_until_it_is_asked_for() {
 #[test]
 fn any_displayable_value_can_be_wrapped() {
     assert_eq!(Safe::name(42).to_string(), "42");
-    assert_eq!(Safe::message(std::path::Path::new("/tmp/x").display()).to_string(), "/tmp/x");
+    assert_eq!(
+        Safe::message(std::path::Path::new("/tmp/x").display()).to_string(),
+        "/tmp/x"
+    );
 
     struct JsonLike;
     impl fmt::Display for JsonLike {
@@ -189,6 +197,9 @@ fn any_displayable_value_can_be_wrapped() {
         }
     }
     let rendered = Safe::message(JsonLike).to_string();
-    assert!(!rendered.contains('\u{202e}'), "a rendered value is sanitised too");
+    assert!(
+        !rendered.contains('\u{202e}'),
+        "a rendered value is sanitised too"
+    );
     assert!(rendered.starts_with("{\"tool\""));
 }

@@ -39,10 +39,10 @@ pub const OVERFLOW_LABEL_KEY: &str = "cardinality";
 /// The cardinality cap bounds how many series exist; this bounds what each one retains.
 /// Without it a metric with 64 values of a megabyte each holds 64 megabytes for the life
 /// of the process.
-pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-
-/// What replaces a control character in a label value.
-const REPLACEMENT: char = '\u{fffd}';
+///
+/// The same limit [`Safe::name`](crate::Safe::name) puts on a log field, so one name reads
+/// the same way whichever signal an operator looks at.
+pub const MAX_LABEL_VALUE_BYTES: usize = crate::safe::MAX_NAME_BYTES;
 
 /// One dimension of a metric.
 ///
@@ -384,12 +384,16 @@ pub(crate) fn emit(summary: &Summary) {
 ///
 /// Control characters are replaced rather than dropped, so the value still shows that
 /// something was there.
+///
+/// The predicate is [`crate::safe::is_deceptive`], shared with [`Safe`](crate::Safe) so a
+/// value cannot read one way on a log line and another in a metrics summary. Widen it
+/// there, once, and both follow.
 pub(crate) fn sanitize(value: String) -> String {
     let mut cleaned: String = value
         .chars()
         .map(|character| {
-            if is_deceptive(character) {
-                REPLACEMENT
+            if crate::safe::is_deceptive(character) {
+                crate::safe::REPLACEMENT
             } else {
                 character
             }
@@ -405,57 +409,6 @@ pub(crate) fn sanitize(value: String) -> String {
         cleaned.truncate(end);
     }
     cleaned
-}
-
-/// Whether this character could change what a person reads, rather than what was written.
-///
-/// Three groups, and they fail in different ways:
-///
-/// - `char::is_control` covers category Cc: C0, C1 and DEL. A newline ends the log line
-///   early and starts one that reads as genuine; an escape drives the terminal.
-/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are categories Zl and Zp.
-///   `is_control` does not cover them, and some log viewers and every JSON consumer treat
-///   them as a line break.
-/// - The bidi controls are category Cf. They leave the bytes honest and the line
-///   structure intact, and reverse what a terminal shows: a tool named with U+202E
-///   renders with everything after it backwards, so the name an operator reads in
-///   `kubectl logs` is not the name that was called. Deception rather than forgery, and
-///   the Trojan-source class.
-///
-/// # Why a list of bidi controls and not all of Cf
-///
-/// Cf also holds U+200D ZERO WIDTH JOINER, which carries the emoji sequences a person
-/// legitimately wants to read. Hiding text is a weaker problem than reversing it, so the
-/// set stops at the characters that change reading order.
-///
-/// The authority for the list is what `mcp-core` strips, so one answer holds across the
-/// fleet. That set is a **superset** of rustc's `text_direction_codepoint_in_literal`
-/// lint: it adds U+061C, U+200E and U+200F, the marks, to the lint's overrides, embeddings
-/// and isolates. The marks are included because a mark still changes reading order in a
-/// log line, which is the property this predicate is about. Do not narrow the list to the
-/// rustc lint on the grounds that the three marks are absent from it - they are absent
-/// deliberately.
-///
-/// # Reason from the categories, not from an attack
-///
-/// This predicate has been widened twice, and both times because it had been written
-/// against the attack in mind - line forgery - rather than against the character
-/// categories that make an attack possible. Cc breaks the line, Zl and Zp break the line
-/// in a JSON consumer, Cf reorders what is displayed. Check a new case against the
-/// categories, and the upper boundary against
-/// `a_zero_width_joiner_survives_the_sanitiser`, which fails if this widens to all of Cf.
-fn is_deceptive(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{2028}'      // LINE SEPARATOR
-            | '\u{2029}'    // PARAGRAPH SEPARATOR
-            | '\u{061c}'    // ARABIC LETTER MARK
-            | '\u{200e}'    // LEFT-TO-RIGHT MARK
-            | '\u{200f}'    // RIGHT-TO-LEFT MARK
-            | '\u{202a}'..='\u{202e}'  // the embeddings, the pop, and the overrides
-            | '\u{2066}'..='\u{2069}'  // the isolates and the pop
-        )
 }
 
 /// Labels as one `key=value,key=value` string.
