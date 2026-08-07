@@ -443,3 +443,77 @@ fn reconfigure_starts_a_fresh_window() {
         "the running total still carries what was recorded before init"
     );
 }
+
+/// Every bidi control the fleet strips, with the name a reader would look it up by.
+///
+/// Built here as Rust escapes rather than pasted as literals. These characters are
+/// invisible and several tools eat them silently, so a test that carried them as text
+/// could assert against something other than what it appears to.
+const BIDI_CONTROLS: &[(char, &str)] = &[
+    ('\u{061c}', "ARABIC LETTER MARK"),
+    ('\u{200e}', "LEFT-TO-RIGHT MARK"),
+    ('\u{200f}', "RIGHT-TO-LEFT MARK"),
+    ('\u{202a}', "LEFT-TO-RIGHT EMBEDDING"),
+    ('\u{202b}', "RIGHT-TO-LEFT EMBEDDING"),
+    ('\u{202c}', "POP DIRECTIONAL FORMATTING"),
+    ('\u{202d}', "LEFT-TO-RIGHT OVERRIDE"),
+    ('\u{202e}', "RIGHT-TO-LEFT OVERRIDE"),
+    ('\u{2066}', "LEFT-TO-RIGHT ISOLATE"),
+    ('\u{2067}', "RIGHT-TO-LEFT ISOLATE"),
+    ('\u{2068}', "FIRST STRONG ISOLATE"),
+    ('\u{2069}', "POP DIRECTIONAL ISOLATE"),
+];
+
+/// A label value cannot reverse what an operator reads.
+///
+/// `char::is_control` covers category Cc only. The bidi controls are category Cf, so
+/// they went through the sanitiser untouched. They leave the line structure alone and
+/// the bytes honest, which is why this is deception rather than forgery: a tool named
+/// with U+202E renders in a terminal with everything after it visually reversed, so the
+/// name in `kubectl logs` is not the name that was called.
+#[test]
+fn label_value_cannot_reverse_what_a_reader_sees() {
+    for (control, name) in BIDI_CONTROLS {
+        let label = Label::new("tool", format!("search{control}reversed"));
+        assert!(
+            !label.value().contains(*control),
+            "U+{:04X} {name} survived the sanitiser: {:?}",
+            *control as u32,
+            label.value()
+        );
+    }
+}
+
+/// The classic Trojan-source shape, end to end through a real series.
+#[test]
+fn a_bidi_override_cannot_disguise_a_tool_name() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    let disguised = format!("delete_all{}dnetxe_", '\u{202e}');
+
+    registry.increment("tool.calls", &[Label::new("tool", disguised)]);
+
+    let summary = registry.snapshot();
+    let value = summary.counters[0].labels[0].value().to_owned();
+    assert!(
+        !value.chars().any(|character| BIDI_CONTROLS
+            .iter()
+            .any(|(control, _)| character == *control)),
+        "the recorded label still carries a bidi control: {value:?}"
+    );
+}
+
+/// A zero-width joiner is also category Cf and must survive.
+///
+/// The boundary is deliberate: the fleet strips the bidi controls, not all of Cf. A
+/// joiner carries emoji sequences a person legitimately wants to read, and hiding text
+/// is a weaker problem than reversing it.
+#[test]
+fn a_zero_width_joiner_survives_the_sanitiser() {
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let label = Label::new("provider", family);
+    assert_eq!(
+        label.value(),
+        family,
+        "U+200D ZERO WIDTH JOINER is Cf but not a bidi control, and must be left alone"
+    );
+}

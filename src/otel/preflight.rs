@@ -186,6 +186,28 @@ pub(crate) fn configuration_summary() -> String {
 mod summary_tests {
     use super::*;
 
+    /// The failure report cannot reverse what an operator reads either.
+    ///
+    /// It is the other place caller-controlled text reaches a log field, and it goes
+    /// through the same sanitiser, so this holds the two together.
+    #[test]
+    fn the_summary_strips_bidi_controls() {
+        // SAFETY: this test owns this variable; no other test in this binary reads it.
+        unsafe {
+            std::env::set_var("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip\u{202e}desrever");
+        }
+        let summary = configuration_summary();
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_COMPRESSION");
+        }
+
+        assert!(
+            !summary.contains('\u{202e}'),
+            "a bidi override reverses the rest of the line for a reader: {summary:?}"
+        );
+        assert!(summary.contains("gzip"), "the readable part must survive");
+    }
+
     /// A password in the endpoint must never be printed.
     ///
     /// Basic auth in the URL is a documented pattern for several OTLP backends, so the
