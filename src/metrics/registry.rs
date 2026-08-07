@@ -1,0 +1,236 @@
+//! The in-process metrics registry.
+//!
+//! Why this exists at all: with the `otel` feature off there is no collector and no
+//! exporter, and a facade that no-opped would make metrics the one signal that simply
+//! vanishes without a backend. Logs still print and spans still decorate the lines, so
+//! metrics accumulate here and get written out periodically. A desktop install from
+//! `cargo install` runs a default-feature build, and this is the only way it ever
+//! reports a number.
+//!
+//! The dump stays on when a backend *is* configured. The two paths report the same
+//! numbers over the same bucket boundaries, so the local dump is a cross-check rather
+//! than a substitute.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::clock::Clock;
+use crate::metrics::histogram::{DURATION_BUCKETS_MS, Histogram, HistogramSnapshot};
+
+/// How many distinct label sets one metric may have before the rest are folded together.
+///
+/// Why a cap: a label taken from a model name, a tool name or a provider is attacker- or
+/// config-controlled in practice, and an unbounded label set is an unbounded memory leak
+/// in a process that runs for weeks.
+pub const DEFAULT_CARDINALITY_CAP: usize = 64;
+
+/// How often the registry writes a summary when nothing says otherwise.
+pub const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// The label value that everything past the cardinality cap is folded into.
+pub const OVERFLOW_LABEL_VALUE: &str = "other";
+
+/// The label key that carries [`OVERFLOW_LABEL_VALUE`].
+pub const OVERFLOW_LABEL_KEY: &str = "cardinality";
+
+/// One dimension of a metric.
+///
+/// Keys are `'static` because a metric's dimensions are a fixed vocabulary chosen at the
+/// call site. Values are owned because they come from data.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Label {
+    key: &'static str,
+    value: String,
+}
+
+impl Label {
+    /// A label with this key and value.
+    pub fn new(key: &'static str, value: impl Into<String>) -> Self {
+        todo!()
+    }
+
+    /// This label's key.
+    pub fn key(&self) -> &'static str {
+        todo!()
+    }
+
+    /// This label's value.
+    pub fn value(&self) -> &str {
+        todo!()
+    }
+}
+
+/// What the registry is allowed to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Settings {
+    /// How long between summaries. [`Duration::ZERO`] turns the summary off entirely.
+    pub dump_interval: Duration,
+    /// How many distinct label sets one metric may have.
+    pub cardinality_cap: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            dump_interval: DEFAULT_DUMP_INTERVAL,
+            cardinality_cap: DEFAULT_CARDINALITY_CAP,
+        }
+    }
+}
+
+/// One counter, as of a dump.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CounterSummary {
+    /// The metric name the call site used.
+    pub name: &'static str,
+    /// The label set, sorted by key.
+    pub labels: Vec<Label>,
+    /// How much the counter rose during the window that just closed.
+    pub window_delta: u64,
+    /// The counter's value over the whole life of the process.
+    pub total: u64,
+}
+
+/// One duration histogram, as of a dump.
+#[derive(Clone, PartialEq, Debug)]
+pub struct HistogramSummary {
+    /// The metric name the call site used.
+    pub name: &'static str,
+    /// The label set, sorted by key.
+    pub labels: Vec<Label>,
+    /// Only the measurements taken during the window that just closed.
+    pub window: HistogramSnapshot,
+    /// Every measurement taken over the whole life of the process.
+    pub total: HistogramSnapshot,
+}
+
+/// Everything the registry holds at one moment.
+///
+/// Why both a window and a total: on a pod that has run for a month, a cumulative number
+/// is dominated by history and stops moving, so a fault that started an hour ago is
+/// invisible in it. The window shows what is happening now, the total shows what the
+/// process has done.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Summary {
+    /// How long the window that just closed lasted.
+    pub window: Duration,
+    /// How long the registry has been collecting.
+    pub uptime: Duration,
+    /// Every counter, sorted by name and then by label set.
+    pub counters: Vec<CounterSummary>,
+    /// Every duration histogram, sorted by name and then by label set.
+    pub histograms: Vec<HistogramSummary>,
+}
+
+impl Summary {
+    /// Whether anything at all has been recorded.
+    pub fn is_empty(&self) -> bool {
+        todo!()
+    }
+}
+
+/// Counters and duration histograms, accumulated in process.
+#[derive(Debug)]
+pub struct Registry {
+    inner: Mutex<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    settings: Settings,
+    clock: Arc<dyn Clock>,
+    started_at: Duration,
+    last_dump_at: Duration,
+    counters: HashMap<SeriesKey, CounterSeries>,
+    histograms: HashMap<SeriesKey, HistogramSeries>,
+    /// How many distinct label sets each metric name has, so the cap is per metric.
+    label_sets: HashMap<&'static str, usize>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SeriesKey {
+    name: &'static str,
+    labels: Vec<Label>,
+}
+
+#[derive(Clone, Debug)]
+struct CounterSeries {
+    total: u64,
+    window: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HistogramSeries {
+    total: Histogram,
+    window: Histogram,
+}
+
+impl Registry {
+    /// An empty registry.
+    pub fn new(settings: Settings, clock: Arc<dyn Clock>) -> Self {
+        todo!()
+    }
+
+    /// Change the settings and the clock without losing what has been recorded.
+    ///
+    /// Why not replace the registry: a call site may record before the binary calls
+    /// `init`, and throwing those measurements away would make the first window wrong.
+    pub fn reconfigure(&self, settings: Settings, clock: Arc<dyn Clock>) {
+        todo!()
+    }
+
+    /// The settings in force.
+    pub fn settings(&self) -> Settings {
+        todo!()
+    }
+
+    /// Add to a counter.
+    pub fn add(&self, name: &'static str, value: u64, labels: &[Label]) {
+        todo!()
+    }
+
+    /// Add one to a counter.
+    pub fn increment(&self, name: &'static str, labels: &[Label]) {
+        todo!()
+    }
+
+    /// Record one duration measurement.
+    pub fn record_duration(&self, name: &'static str, value: Duration, labels: &[Label]) {
+        todo!()
+    }
+
+    /// Everything recorded so far, leaving the window open.
+    pub fn snapshot(&self) -> Summary {
+        todo!()
+    }
+
+    /// How many distinct series the registry holds, counters and histograms together.
+    pub fn series_count(&self) -> usize {
+        todo!()
+    }
+
+    /// A summary if one is due, closing the window and starting a new one.
+    ///
+    /// Returns `None` when the dump interval is [`Duration::ZERO`], or when not enough
+    /// time has passed. The summary is written to the log as well as returned.
+    pub fn dump_if_due(&self) -> Option<Summary> {
+        todo!()
+    }
+
+    /// A summary now, whatever the interval says, closing the window.
+    ///
+    /// The guard calls this on the way out so the window that was open at shutdown is not
+    /// lost. A restart is exactly when those numbers matter.
+    pub fn dump_now(&self) -> Summary {
+        todo!()
+    }
+}
+
+/// Write a summary to the log.
+///
+/// Every field is a name, a label, a count or a duration. No measurement carries content,
+/// so this stays at INFO.
+pub(crate) fn emit(summary: &Summary) {
+    todo!()
+}
