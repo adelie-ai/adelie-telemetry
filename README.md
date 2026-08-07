@@ -178,6 +178,38 @@ metrics::record_duration("llm.latency", Duration::from_millis(320), &[]);
 They never reach for an opentelemetry meter directly. That would make every crate that
 records a metric depend on opentelemetry whether or not the feature is on.
 
+### Testing against it
+
+Two pieces of state in this crate are process-global, and a test binary runs its tests in
+parallel threads of one process. Both bite the same way.
+
+**The registry.** `metrics::global()` is shared by every test in a binary, so two tests that
+record into it, or that reconfigure it, interfere. Build a `Registry` of your own with
+`Registry::new` and an injected clock; reach for the global only where the facade itself is
+what you are testing, and give that test a binary to itself. Tracked as
+[#6](https://github.com/adelie-ai/adelie-telemetry/issues/6).
+
+**The environment.** The `OTEL_*` variables are worse. `std::env::set_var` is `unsafe` in
+edition 2024 because `setenv` rewrites a shared array while any other thread may be reading
+it - so two tests that set *different* variables still race, and a comment claiming a test
+owns its variable is not a sound basis for the `unsafe` block. Do not test by mutating the
+environment. Inject the lookup instead, the same way this crate injects the clock, and read
+the variables once at the edge:
+
+```rust
+fn build(lookup: impl Fn(&str) -> Option<String>) -> Config { /* ... */ }
+
+// production
+build(|name| std::env::var(name).ok());
+
+// test - no unsafe, no lock, and every test runs in parallel
+build(|name| (name == "OTEL_EXPORTER_OTLP_PROTOCOL").then(|| "grpc".to_owned()));
+```
+
+Where a test genuinely must set a real variable - driving a whole process, say - put it in
+a child process instead, as `tests/acceptance_resilience.rs` does. A separate process has
+its own environment and cannot race this one.
+
 ### The registry runs with or without a collector
 
 With the `otel` feature off the facade does not no-op. It keeps counters and fixed-bucket
