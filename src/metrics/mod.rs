@@ -35,16 +35,17 @@ pub use registry::{
     OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE, Registry, Settings, Summary,
 };
 
-pub(crate) use histogram::Histogram;
-pub(crate) use registry::emit;
-
 /// The registry the free functions in this module record into.
 ///
 /// It is created on first use rather than by `init`, so a call site that records before
 /// the binary installs telemetry still has its measurement counted. `init` reconfigures
 /// this registry; it never replaces it.
-static GLOBAL: LazyLock<Registry> =
-    LazyLock::new(|| Registry::new(Settings::default(), Arc::new(crate::clock::SystemClock::new())));
+static GLOBAL: LazyLock<Registry> = LazyLock::new(|| {
+    Registry::new(
+        Settings::default(),
+        Arc::new(crate::clock::SystemClock::new()),
+    )
+});
 
 /// The registry the free functions record into.
 pub fn global() -> &'static Registry {

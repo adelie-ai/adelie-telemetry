@@ -17,8 +17,8 @@ use std::time::Duration;
 /// this work was a four-minute answer. A measurement above the last boundary lands in the
 /// overflow bucket.
 pub const DURATION_BUCKETS_MS: &[f64] = &[
-    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
-    30_000.0, 60_000.0, 120_000.0, 300_000.0,
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+    60_000.0, 120_000.0, 300_000.0,
 ];
 
 /// One bucket of a histogram.
@@ -45,7 +45,10 @@ pub struct HistogramSnapshot {
 impl HistogramSnapshot {
     /// The bucket boundaries this snapshot was built with, overflow bucket included.
     pub fn bounds(&self) -> Vec<f64> {
-        todo!()
+        self.buckets
+            .iter()
+            .map(|bucket| bucket.upper_bound_ms)
+            .collect()
     }
 
     /// The upper bound of the bucket the given quantile falls in, in milliseconds.
@@ -54,12 +57,29 @@ impl HistogramSnapshot {
     /// it. Reporting the bound is honest about that. Returns `None` when nothing has been
     /// recorded.
     pub fn quantile_ms(&self, quantile: f64) -> Option<f64> {
-        todo!()
+        if self.count == 0 {
+            return None;
+        }
+        let quantile = quantile.clamp(0.0, 1.0);
+        // The rank of the measurement we are looking for, counting from one.
+        let target = (quantile * self.count as f64).ceil().max(1.0) as u64;
+
+        let mut seen = 0;
+        for bucket in &self.buckets {
+            seen += bucket.count;
+            if seen >= target {
+                return Some(bucket.upper_bound_ms);
+            }
+        }
+        self.buckets.last().map(|bucket| bucket.upper_bound_ms)
     }
 
     /// The arithmetic mean, in milliseconds, or `None` when nothing has been recorded.
     pub fn mean_ms(&self) -> Option<f64> {
-        todo!()
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.sum_ms / self.count as f64)
     }
 }
 
@@ -75,21 +95,51 @@ pub(crate) struct Histogram {
 impl Histogram {
     /// An empty histogram over the given boundaries.
     pub(crate) fn new(bounds: &'static [f64]) -> Self {
-        todo!()
+        Self {
+            bounds,
+            // One slot per boundary, plus the overflow bucket past the last one.
+            counts: vec![0; bounds.len() + 1],
+            count: 0,
+            sum_ms: 0.0,
+        }
     }
 
     /// Add one measurement.
     pub(crate) fn record(&mut self, value: Duration) {
-        todo!()
+        let millis = value.as_secs_f64() * 1_000.0;
+        let index = self
+            .bounds
+            .iter()
+            .position(|bound| millis <= *bound)
+            .unwrap_or(self.bounds.len());
+        self.counts[index] += 1;
+        self.count += 1;
+        self.sum_ms += millis;
     }
 
     /// This histogram as a snapshot, leaving it unchanged.
     pub(crate) fn snapshot(&self) -> HistogramSnapshot {
-        todo!()
+        let buckets = self
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| Bucket {
+                upper_bound_ms: self.bounds.get(index).copied().unwrap_or(f64::INFINITY),
+                count: *count,
+            })
+            .collect();
+
+        HistogramSnapshot {
+            count: self.count,
+            sum_ms: self.sum_ms,
+            buckets,
+        }
     }
 
     /// Forget every measurement, keeping the boundaries.
     pub(crate) fn reset(&mut self) {
-        todo!()
+        self.counts.iter_mut().for_each(|count| *count = 0);
+        self.count = 0;
+        self.sum_ms = 0.0;
     }
 }

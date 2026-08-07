@@ -73,51 +73,69 @@ pub enum TraceContextError {
 impl TraceId {
     /// The trace id these bytes spell, or an error if they are all zero.
     pub fn from_bytes(bytes: [u8; TRACE_ID_BYTES]) -> Result<Self, TraceContextError> {
-        todo!()
+        if bytes == [0; TRACE_ID_BYTES] {
+            return Err(TraceContextError::ZeroTraceId);
+        }
+        Ok(Self(bytes))
     }
 
     /// The bytes behind this id.
     pub fn to_bytes(self) -> [u8; TRACE_ID_BYTES] {
-        todo!()
+        self.0
     }
 
     /// This id as the 32 lowercase hexadecimal characters a `traceparent` carries.
     pub fn to_hex(self) -> String {
-        todo!()
+        to_hex(&self.0)
     }
 
     /// The trace id these 32 hexadecimal characters spell.
     pub fn from_hex(hex: &str) -> Result<Self, TraceContextError> {
-        todo!()
+        let bytes = from_hex::<TRACE_ID_BYTES>(hex).ok_or(TraceContextError::Malformed {
+            field: "trace-id",
+            expected: TRACE_ID_BYTES * 2,
+        })?;
+        Self::from_bytes(bytes)
     }
 }
 
 impl SpanId {
     /// The span id these bytes spell, or an error if they are all zero.
     pub fn from_bytes(bytes: [u8; SPAN_ID_BYTES]) -> Result<Self, TraceContextError> {
-        todo!()
+        if bytes == [0; SPAN_ID_BYTES] {
+            return Err(TraceContextError::ZeroSpanId);
+        }
+        Ok(Self(bytes))
     }
 
     /// The bytes behind this id.
     pub fn to_bytes(self) -> [u8; SPAN_ID_BYTES] {
-        todo!()
+        self.0
     }
 
     /// This id as the 16 lowercase hexadecimal characters a `traceparent` carries.
     pub fn to_hex(self) -> String {
-        todo!()
+        to_hex(&self.0)
     }
 
     /// The span id these 16 hexadecimal characters spell.
     pub fn from_hex(hex: &str) -> Result<Self, TraceContextError> {
-        todo!()
+        let bytes = from_hex::<SPAN_ID_BYTES>(hex).ok_or(TraceContextError::Malformed {
+            field: "span-id",
+            expected: SPAN_ID_BYTES * 2,
+        })?;
+        Self::from_bytes(bytes)
     }
 }
 
 impl TraceParent {
     /// A `traceparent` built from its parts.
     pub fn new(trace_id: TraceId, span_id: SpanId, sampled: bool) -> Self {
-        todo!()
+        Self {
+            trace_id,
+            span_id,
+            sampled,
+        }
     }
 
     /// A `traceparent` for a process that has no spans of its own.
@@ -128,39 +146,62 @@ impl TraceParent {
     /// continues. The id is deterministic, so the same turn always produces the same
     /// header.
     pub fn root_for(trace_id: TraceId, sampled: bool) -> Self {
-        todo!()
+        let bytes = trace_id.to_bytes();
+        let mut span_bytes = [0u8; SPAN_ID_BYTES];
+        span_bytes.copy_from_slice(&bytes[..SPAN_ID_BYTES]);
+        // A trace id is never all zero, but its first eight bytes can be. Fall back to
+        // the last eight, which cannot then also be zero.
+        if span_bytes == [0; SPAN_ID_BYTES] {
+            span_bytes.copy_from_slice(&bytes[SPAN_ID_BYTES..]);
+        }
+        Self {
+            trace_id,
+            span_id: SpanId(span_bytes),
+            sampled,
+        }
     }
 
     /// The trace this context belongs to.
     pub fn trace_id(self) -> TraceId {
-        todo!()
+        self.trace_id
     }
 
     /// The span that should become the parent of anything this process starts.
     pub fn span_id(self) -> SpanId {
-        todo!()
+        self.span_id
     }
 
     /// Whether the originator sampled this trace.
     pub fn sampled(self) -> bool {
-        todo!()
+        self.sampled
     }
 
     /// This context as a `traceparent` header value.
     pub fn to_header(self) -> String {
-        todo!()
+        format!(
+            "{VERSION}-{}-{}-{:02x}",
+            self.trace_id.to_hex(),
+            self.span_id.to_hex(),
+            u8::from(self.sampled)
+        )
     }
 }
 
 impl TraceOrigin {
     /// The trace id, whichever way it was arrived at.
     pub fn trace_id(self) -> TraceId {
-        todo!()
+        match self {
+            Self::Continued(parent) => parent.trace_id(),
+            Self::Minted(trace_id) => trace_id,
+        }
     }
 
     /// The span to hang new work from, when the trace was continued.
     pub fn parent_span_id(self) -> Option<SpanId> {
-        todo!()
+        match self {
+            Self::Continued(parent) => Some(parent.span_id()),
+            Self::Minted(_) => None,
+        }
     }
 }
 
@@ -173,7 +214,7 @@ impl TraceOrigin {
 /// Why this rejects the all-zero case: the spec reserves it as the "no trace" sentinel,
 /// and a backend drops a span that carries it.
 pub fn trace_id_from_uuid(uuid_bytes: [u8; TRACE_ID_BYTES]) -> Result<TraceId, TraceContextError> {
-    todo!()
+    TraceId::from_bytes(uuid_bytes)
 }
 
 /// The trace context a `traceparent` header value carries.
@@ -181,12 +222,49 @@ pub fn trace_id_from_uuid(uuid_bytes: [u8; TRACE_ID_BYTES]) -> Result<TraceId, T
 /// Unknown future versions are accepted and their extra fields ignored, as the W3C spec
 /// requires. Version `ff` is reserved and is rejected.
 pub fn extract_traceparent(header: &str) -> Result<TraceParent, TraceContextError> {
-    todo!()
+    let fields: Vec<&str> = header.trim().split('-').collect();
+    if fields.len() < 4 {
+        return Err(TraceContextError::FieldCount {
+            found: fields.len(),
+        });
+    }
+
+    let version = fields[0];
+    if version.len() != 2 || !version.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TraceContextError::Malformed {
+            field: "version",
+            expected: 2,
+        });
+    }
+    if version.eq_ignore_ascii_case("ff") {
+        return Err(TraceContextError::ReservedVersion);
+    }
+
+    let trace_id = TraceId::from_hex(fields[1])?;
+    let span_id = SpanId::from_hex(fields[2])?;
+
+    let flags = fields[3];
+    if flags.len() != 2 || !flags.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TraceContextError::Malformed {
+            field: "flags",
+            expected: 2,
+        });
+    }
+    let flags = u8::from_str_radix(flags, 16).map_err(|_| TraceContextError::Malformed {
+        field: "flags",
+        expected: 2,
+    })?;
+
+    Ok(TraceParent {
+        trace_id,
+        span_id,
+        sampled: flags & FLAG_SAMPLED != 0,
+    })
 }
 
 /// The `traceparent` header value for this context.
 pub fn inject_traceparent(parent: TraceParent) -> String {
-    todo!()
+    parent.to_header()
 }
 
 /// The trace to use for a turn.
@@ -199,7 +277,31 @@ pub fn resolve_trace(
     incoming_traceparent: Option<&str>,
     request_id: [u8; TRACE_ID_BYTES],
 ) -> Result<TraceOrigin, TraceContextError> {
-    todo!()
+    match incoming_traceparent {
+        Some(header) => extract_traceparent(header).map(TraceOrigin::Continued),
+        None => trace_id_from_uuid(request_id).map(TraceOrigin::Minted),
+    }
+}
+
+/// The `traceparent` version this crate writes.
+const VERSION: &str = "00";
+
+/// The `sampled` bit of the `traceparent` flags field.
+const FLAG_SAMPLED: u8 = 0x01;
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn from_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 impl fmt::Debug for TraceId {

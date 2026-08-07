@@ -1,5 +1,3 @@
-#![allow(unused_variables, unused_imports, dead_code)]
-
 //! One telemetry setup for every Adelie Rust binary: traces, metrics and logs,
 //! configured the same way everywhere.
 //!

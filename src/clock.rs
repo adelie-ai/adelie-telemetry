@@ -89,7 +89,11 @@ mod tests {
     fn manual_clock_starts_at_zero_and_only_moves_when_advanced() {
         let clock = ManualClock::new();
         assert_eq!(clock.now(), Duration::ZERO);
-        assert_eq!(clock.now(), Duration::ZERO, "reading the clock must not move it");
+        assert_eq!(
+            clock.now(),
+            Duration::ZERO,
+            "reading the clock must not move it"
+        );
 
         clock.advance(Duration::from_secs(30));
         assert_eq!(clock.now(), Duration::from_secs(30));

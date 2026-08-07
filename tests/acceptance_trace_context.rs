@@ -67,7 +67,10 @@ fn traceparent_extract_takes_precedence_over_mint() {
     let TraceOrigin::Continued(parent) = origin else {
         panic!("a valid incoming traceparent must continue that trace, not mint a new one");
     };
-    assert_eq!(parent.trace_id().to_hex(), "0af7651916cd43dd8448eb211c80319c");
+    assert_eq!(
+        parent.trace_id().to_hex(),
+        "0af7651916cd43dd8448eb211c80319c"
+    );
     assert_eq!(parent.span_id().to_hex(), "b7ad6b7169203331");
     assert!(parent.sampled());
     assert_eq!(
@@ -84,7 +87,10 @@ fn resolve_trace_mints_from_request_id_when_no_header_arrives() {
     let origin =
         trace_context::resolve_trace(None, REQUEST_ID).expect("a non-zero request id is valid");
 
-    assert_eq!(origin, TraceOrigin::Minted(TraceId::from_bytes(REQUEST_ID).expect("non-zero")));
+    assert_eq!(
+        origin,
+        TraceOrigin::Minted(TraceId::from_bytes(REQUEST_ID).expect("non-zero"))
+    );
     assert_eq!(origin.trace_id().to_bytes(), REQUEST_ID);
     assert_eq!(
         origin.parent_span_id(),
@@ -111,7 +117,10 @@ fn traceparent_round_trips_through_inject_and_extract() {
     let parent = TraceParent::new(trace_id, span_id, false);
 
     let header = trace_context::inject_traceparent(parent);
-    assert_eq!(header, "00-4bf92f3577b34da6a3ce929d0e0e4736-0102030405060708-00");
+    assert_eq!(
+        header,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0102030405060708-00"
+    );
     assert_eq!(
         trace_context::extract_traceparent(&header).expect("our own header must parse"),
         parent
@@ -124,7 +133,10 @@ fn traceparent_accepts_an_unknown_future_version() {
     let header = "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extrafield";
     let parent = trace_context::extract_traceparent(header)
         .expect("a newer version must be read, not rejected");
-    assert_eq!(parent.trace_id().to_hex(), "0af7651916cd43dd8448eb211c80319c");
+    assert_eq!(
+        parent.trace_id().to_hex(),
+        "0af7651916cd43dd8448eb211c80319c"
+    );
 }
 
 /// Version `ff` is reserved.

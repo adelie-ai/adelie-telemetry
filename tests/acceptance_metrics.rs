@@ -161,7 +161,10 @@ fn metrics_cardinality_cap_is_per_metric() {
 
     for index in 0..10 {
         registry.increment("tool.calls", &[Label::new("tool", format!("tool-{index}"))]);
-        registry.increment("llm.requests", &[Label::new("model", format!("model-{index}"))]);
+        registry.increment(
+            "llm.requests",
+            &[Label::new("model", format!("model-{index}"))],
+        );
     }
 
     assert_eq!(
@@ -232,7 +235,10 @@ fn histogram_places_measurements_in_the_right_buckets() {
     // The tail is what a mean hides, which is the reason for buckets at all.
     assert_eq!(snapshot.quantile_ms(0.5), Some(500.0));
     assert_eq!(snapshot.quantile_ms(0.99), Some(f64::INFINITY));
-    assert_eq!(snapshot.mean_ms(), Some((3.0 + 300.0 + 240_000.0 + 3_600_000.0) / 4.0));
+    assert_eq!(
+        snapshot.mean_ms(),
+        Some((3.0 + 300.0 + 240_000.0 + 3_600_000.0) / 4.0)
+    );
 }
 
 /// An empty histogram reports nothing rather than a misleading zero.

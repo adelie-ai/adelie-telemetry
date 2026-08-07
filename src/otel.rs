@@ -117,19 +117,20 @@ impl Pipelines {
     /// failed when it sees an error event, and that status is what makes a failed turn
     /// visible in a trace view rather than looking green. Error events are therefore
     /// allowed through to both, and are the only events that appear twice.
-    pub(crate) fn layers<S>(&self) -> impl Layer<S> + use<S>
+    pub(crate) fn layers<S>(&self) -> Vec<Box<dyn Layer<S> + Send + Sync>>
     where
-        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
     {
-        let trace_layer = tracing_opentelemetry::layer()
+        let trace_layer = tracing_opentelemetry::layer::<S>()
             .with_tracer(self.traces.tracer(env!("CARGO_PKG_NAME")))
-            .with_filter(filter_fn(|metadata| {
+            .with_filter(filter_fn(|metadata: &tracing::Metadata<'_>| {
                 metadata.is_span() || *metadata.level() == Level::ERROR
             }));
 
-        let log_layer = OpenTelemetryTracingBridge::new(&self.logs);
+        let log_layer: OpenTelemetryTracingBridge<SdkLoggerProvider, _> =
+            OpenTelemetryTracingBridge::new(&self.logs);
 
-        (trace_layer, log_layer)
+        vec![Box::new(trace_layer), Box::new(log_layer)]
     }
 
     /// Flush and shut down all three pipelines, in the order traces, metrics, logs.

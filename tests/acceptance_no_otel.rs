@@ -20,7 +20,15 @@ fn default_build_pulls_no_opentelemetry() {
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
     let output = Command::new(cargo)
-        .args(["tree", "--edges", "normal", "--prefix", "none", "--manifest-path", manifest])
+        .args([
+            "tree",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--manifest-path",
+            manifest,
+        ])
         .output()
         .expect("cargo tree must run");
 

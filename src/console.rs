@@ -14,8 +14,7 @@ use crate::config::Config;
 /// who turns the verbosity up expects to see the same lines wherever they are reading,
 /// and a second filter would mean two answers to "why is this line missing".
 pub(crate) fn env_filter(config: &Config) -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(config.default_filter()))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.default_filter()))
 }
 
 /// The console layer.
@@ -25,7 +24,12 @@ pub(crate) fn env_filter(config: &Config) -> EnvFilter {
 pub(crate) fn console_layer<S, W>(
     config: &Config,
     writer: W,
-) -> tracing_subscriber::fmt::Layer<S, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, W>
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    W,
+>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     W: for<'a> MakeWriter<'a> + 'static,

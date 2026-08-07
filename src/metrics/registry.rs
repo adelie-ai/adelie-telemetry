@@ -47,17 +47,20 @@ pub struct Label {
 impl Label {
     /// A label with this key and value.
     pub fn new(key: &'static str, value: impl Into<String>) -> Self {
-        todo!()
+        Self {
+            key,
+            value: value.into(),
+        }
     }
 
     /// This label's key.
     pub fn key(&self) -> &'static str {
-        todo!()
+        self.key
     }
 
     /// This label's value.
     pub fn value(&self) -> &str {
-        todo!()
+        &self.value
     }
 }
 
@@ -126,7 +129,7 @@ pub struct Summary {
 impl Summary {
     /// Whether anything at all has been recorded.
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.counters.is_empty() && self.histograms.is_empty()
     }
 }
 
@@ -169,7 +172,18 @@ struct HistogramSeries {
 impl Registry {
     /// An empty registry.
     pub fn new(settings: Settings, clock: Arc<dyn Clock>) -> Self {
-        todo!()
+        let started_at = clock.now();
+        Self {
+            inner: Mutex::new(Inner {
+                settings,
+                clock,
+                started_at,
+                last_dump_at: started_at,
+                counters: HashMap::new(),
+                histograms: HashMap::new(),
+                label_sets: HashMap::new(),
+            }),
+        }
     }
 
     /// Change the settings and the clock without losing what has been recorded.
@@ -177,37 +191,62 @@ impl Registry {
     /// Why not replace the registry: a call site may record before the binary calls
     /// `init`, and throwing those measurements away would make the first window wrong.
     pub fn reconfigure(&self, settings: Settings, clock: Arc<dyn Clock>) {
-        todo!()
+        let mut inner = self.lock();
+        // The new clock has its own origin, so the window and the uptime restart from it.
+        // Keeping the old readings would mix two unrelated timelines.
+        let now = clock.now();
+        inner.settings = settings;
+        inner.clock = clock;
+        inner.started_at = now;
+        inner.last_dump_at = now;
     }
 
     /// The settings in force.
     pub fn settings(&self) -> Settings {
-        todo!()
+        self.lock().settings
     }
 
     /// Add to a counter.
     pub fn add(&self, name: &'static str, value: u64, labels: &[Label]) {
-        todo!()
+        let mut inner = self.lock();
+        let key = inner.key_for(name, labels, Instrument::Counter);
+        let series = inner.counters.entry(key).or_insert(CounterSeries {
+            total: 0,
+            window: 0,
+        });
+        series.total = series.total.saturating_add(value);
+        series.window = series.window.saturating_add(value);
     }
 
     /// Add one to a counter.
     pub fn increment(&self, name: &'static str, labels: &[Label]) {
-        todo!()
+        self.add(name, 1, labels);
     }
 
     /// Record one duration measurement.
     pub fn record_duration(&self, name: &'static str, value: Duration, labels: &[Label]) {
-        todo!()
+        let mut inner = self.lock();
+        let key = inner.key_for(name, labels, Instrument::Histogram);
+        let series = inner
+            .histograms
+            .entry(key)
+            .or_insert_with(|| HistogramSeries {
+                total: Histogram::new(DURATION_BUCKETS_MS),
+                window: Histogram::new(DURATION_BUCKETS_MS),
+            });
+        series.total.record(value);
+        series.window.record(value);
     }
 
     /// Everything recorded so far, leaving the window open.
     pub fn snapshot(&self) -> Summary {
-        todo!()
+        self.lock().summarize()
     }
 
     /// How many distinct series the registry holds, counters and histograms together.
     pub fn series_count(&self) -> usize {
-        todo!()
+        let inner = self.lock();
+        inner.counters.len() + inner.histograms.len()
     }
 
     /// A summary if one is due, closing the window and starting a new one.
@@ -215,7 +254,18 @@ impl Registry {
     /// Returns `None` when the dump interval is [`Duration::ZERO`], or when not enough
     /// time has passed. The summary is written to the log as well as returned.
     pub fn dump_if_due(&self) -> Option<Summary> {
-        todo!()
+        let summary = {
+            let mut inner = self.lock();
+            if inner.settings.dump_interval.is_zero() {
+                return None;
+            }
+            if inner.clock.now().saturating_sub(inner.last_dump_at) < inner.settings.dump_interval {
+                return None;
+            }
+            inner.close_window()
+        };
+        emit(&summary);
+        Some(summary)
     }
 
     /// A summary now, whatever the interval says, closing the window.
@@ -223,7 +273,19 @@ impl Registry {
     /// The guard calls this on the way out so the window that was open at shutdown is not
     /// lost. A restart is exactly when those numbers matter.
     pub fn dump_now(&self) -> Summary {
-        todo!()
+        let summary = self.lock().close_window();
+        if !summary.is_empty() {
+            emit(&summary);
+        }
+        summary
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // A panic while holding this lock leaves the counters readable and only slightly
+        // wrong. Losing every metric for the life of the process would be worse.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -232,5 +294,151 @@ impl Registry {
 /// Every field is a name, a label, a count or a duration. No measurement carries content,
 /// so this stays at INFO.
 pub(crate) fn emit(summary: &Summary) {
-    todo!()
+    if summary.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        window_seconds = summary.window.as_secs(),
+        uptime_seconds = summary.uptime.as_secs(),
+        counters = summary.counters.len(),
+        histograms = summary.histograms.len(),
+        "metrics summary"
+    );
+
+    for counter in &summary.counters {
+        tracing::info!(
+            metric = counter.name,
+            labels = %render_labels(&counter.labels),
+            window = counter.window_delta,
+            total = counter.total,
+            "counter"
+        );
+    }
+
+    for histogram in &summary.histograms {
+        tracing::info!(
+            metric = histogram.name,
+            labels = %render_labels(&histogram.labels),
+            window_count = histogram.window.count,
+            window_p50_ms = histogram.window.quantile_ms(0.50),
+            window_p95_ms = histogram.window.quantile_ms(0.95),
+            total_count = histogram.total.count,
+            total_p95_ms = histogram.total.quantile_ms(0.95),
+            "duration"
+        );
+    }
+}
+
+/// Labels as one `key=value,key=value` string.
+fn render_labels(labels: &[Label]) -> String {
+    labels
+        .iter()
+        .map(|label| format!("{}={}", label.key, label.value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Which map a measurement belongs in. The cardinality cap counts a name's label sets
+/// once, so a counter and a histogram of the same name share one budget.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Instrument {
+    Counter,
+    Histogram,
+}
+
+impl Inner {
+    /// The series key for this measurement, folding into the overflow series once the
+    /// metric has as many label sets as the cap allows.
+    fn key_for(
+        &mut self,
+        name: &'static str,
+        labels: &[Label],
+        instrument: Instrument,
+    ) -> SeriesKey {
+        let mut sorted = labels.to_vec();
+        // Sorted, so the order the call site wrote the labels in cannot split one series
+        // into two.
+        sorted.sort();
+        sorted.dedup();
+
+        let candidate = SeriesKey {
+            name,
+            labels: sorted,
+        };
+
+        let known = match instrument {
+            Instrument::Counter => self.counters.contains_key(&candidate),
+            Instrument::Histogram => self.histograms.contains_key(&candidate),
+        };
+        if known {
+            return candidate;
+        }
+
+        let seen = self.label_sets.entry(name).or_insert(0);
+        if *seen >= self.settings.cardinality_cap {
+            return SeriesKey {
+                name,
+                labels: vec![Label::new(OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE)],
+            };
+        }
+        *seen += 1;
+        candidate
+    }
+
+    /// Close the current window and start a new one.
+    fn close_window(&mut self) -> Summary {
+        let summary = self.summarize();
+        for series in self.counters.values_mut() {
+            series.window = 0;
+        }
+        for series in self.histograms.values_mut() {
+            series.window.reset();
+        }
+        self.last_dump_at = self.clock.now();
+        summary
+    }
+
+    fn summarize(&self) -> Summary {
+        let now = self.clock.now();
+
+        let mut counters: Vec<CounterSummary> = self
+            .counters
+            .iter()
+            .map(|(key, series)| CounterSummary {
+                name: key.name,
+                labels: key.labels.clone(),
+                window_delta: series.window,
+                total: series.total,
+            })
+            .collect();
+        counters.sort_by(|left, right| {
+            left.name
+                .cmp(right.name)
+                .then_with(|| left.labels.cmp(&right.labels))
+        });
+
+        let mut histograms: Vec<HistogramSummary> = self
+            .histograms
+            .iter()
+            .map(|(key, series)| HistogramSummary {
+                name: key.name,
+                labels: key.labels.clone(),
+                window: series.window.snapshot(),
+                total: series.total.snapshot(),
+            })
+            .collect();
+        histograms.sort_by(|left, right| {
+            left.name
+                .cmp(right.name)
+                .then_with(|| left.labels.cmp(&right.labels))
+        });
+
+        Summary {
+            window: now.saturating_sub(self.last_dump_at),
+            uptime: now.saturating_sub(self.started_at),
+            counters,
+            histograms,
+        }
+    }
 }
