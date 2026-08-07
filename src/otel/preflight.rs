@@ -134,6 +134,23 @@ mod tests {
 /// `OTEL_EXPORTER_OTLP_HEADERS` and its per-signal forms, which routinely carry an API
 /// key. Those are reported as set or unset and never by value.
 pub(crate) fn configuration_summary() -> String {
+    summarize(|name| std::env::var(name).ok())
+}
+
+/// The report, built from a given source of values.
+///
+/// The source is a parameter rather than `std::env` for the same reason the metrics
+/// registry takes a clock: a test cannot set up process-global state without disturbing
+/// another test running beside it.
+///
+/// The environment is the worst example of that. `std::env::set_var` is `unsafe` in
+/// edition 2024 because `setenv` rewrites a shared array while any other thread may be
+/// reading it, and that holds whichever variable is named - so giving each test its own
+/// variable would not make the mutation sound, it would only hide the collision. A lock
+/// would serialise this crate's own tests and still not cover a read from a runtime
+/// thread. Injecting the lookup removes the mutation rather than scheduling around it,
+/// and the tests below need no `unsafe` at all.
+fn summarize(lookup: impl Fn(&str) -> Option<String>) -> String {
     const VALUE_VARS: &[&str] = &[
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
@@ -160,7 +177,7 @@ pub(crate) fn configuration_summary() -> String {
     let mut parts: Vec<String> = VALUE_VARS
         .iter()
         .filter_map(|name| {
-            std::env::var(name).ok().map(|value| {
+            lookup(name).map(|value| {
                 format!(
                     "{name}={}",
                     crate::metrics::sanitize(redact_userinfo(&value))
@@ -171,7 +188,7 @@ pub(crate) fn configuration_summary() -> String {
     parts.extend(
         SECRET_VARS
             .iter()
-            .filter(|name| std::env::var(name).is_ok())
+            .filter(|name| lookup(name).is_some())
             .map(|name| format!("{name}=<set>")),
     );
 
@@ -186,20 +203,30 @@ pub(crate) fn configuration_summary() -> String {
 mod summary_tests {
     use super::*;
 
-    /// The failure report cannot reverse what an operator reads either.
+    /// A report built from the given values, touching no process-global state.
+    ///
+    /// Every test here can run beside every other, because none of them writes to the
+    /// environment. That is the point of `summarize` taking its source as a parameter.
+    fn summary_of(values: &[(&str, &str)]) -> String {
+        let owned: Vec<(String, String)> = values
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        summarize(|name| {
+            owned
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    /// The failure report cannot reverse what an operator reads.
     ///
     /// It is the other place caller-controlled text reaches a log field, and it goes
     /// through the same sanitiser, so this holds the two together.
     #[test]
     fn the_summary_strips_bidi_controls() {
-        // SAFETY: this test owns this variable; no other test in this binary reads it.
-        unsafe {
-            std::env::set_var("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip\u{202e}desrever");
-        }
-        let summary = configuration_summary();
-        unsafe {
-            std::env::remove_var("OTEL_EXPORTER_OTLP_COMPRESSION");
-        }
+        let summary = summary_of(&[("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip\u{202e}desrever")]);
 
         assert!(
             !summary.contains('\u{202e}'),
@@ -214,17 +241,10 @@ mod summary_tests {
     /// value really does carry one.
     #[test]
     fn the_summary_redacts_credentials_in_an_endpoint() {
-        // SAFETY: this test owns this variable; no other test in this binary reads it.
-        unsafe {
-            std::env::set_var(
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "https://svcuser:S3cretInUrl@collector.example.com:4318/v1/traces",
-            );
-        }
-        let summary = configuration_summary();
-        unsafe {
-            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-        }
+        let summary = summary_of(&[(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "https://svcuser:S3cretInUrl@collector.example.com:4318/v1/traces",
+        )]);
 
         assert!(
             !summary.contains("S3cretInUrl"),
@@ -248,22 +268,14 @@ mod summary_tests {
         assert_eq!(redact_userinfo("not-a-url"), "not-a-url");
     }
 
-    /// An environment variable cannot forge a log line, for the same reason a metric
-    /// label cannot: the report goes into a log field, and a newline in a field ends the
-    /// line early.
+    /// A value cannot forge a log line, for the same reason a metric label cannot: the
+    /// report goes into a log field, and a newline in a field ends the line early.
     #[test]
     fn the_summary_cannot_forge_a_log_line() {
-        // SAFETY: this test owns this variable; no other test in this binary reads it.
-        unsafe {
-            std::env::set_var(
-                "OTEL_EXPORTER_OTLP_COMPRESSION",
-                "gzip\n2026-08-07T00:00:00.000000Z  INFO probe: FORGED user=root",
-            );
-        }
-        let summary = configuration_summary();
-        unsafe {
-            std::env::remove_var("OTEL_EXPORTER_OTLP_COMPRESSION");
-        }
+        let summary = summary_of(&[(
+            "OTEL_EXPORTER_OTLP_COMPRESSION",
+            "gzip\n2026-08-07T00:00:00.000000Z  INFO probe: FORGED user=root",
+        )]);
 
         assert!(
             !summary.contains('\n'),
@@ -276,19 +288,36 @@ mod summary_tests {
     /// A header value is a credential often enough that it is never printed.
     #[test]
     fn the_summary_never_prints_a_header_value() {
-        // SAFETY: this test owns these variables; no other test in this binary reads them.
-        unsafe {
-            std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", "api-key=super-secret-value");
-        }
-        let summary = configuration_summary();
-        unsafe {
-            std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
-        }
+        let summary = summary_of(&[("OTEL_EXPORTER_OTLP_HEADERS", "api-key=super-secret-value")]);
 
         assert!(summary.contains("OTEL_EXPORTER_OTLP_HEADERS=<set>"));
         assert!(
             !summary.contains("super-secret-value"),
             "a header value is a credential and must never reach the log: {summary}"
         );
+    }
+
+    /// With nothing set, the report says so rather than being blank.
+    #[test]
+    fn an_empty_environment_is_reported_as_such() {
+        assert_eq!(summary_of(&[]), "no OTEL_EXPORTER_OTLP_* variable is set");
+    }
+
+    /// Every variable that is set appears, so the report is not silently partial.
+    #[test]
+    fn every_set_variable_appears() {
+        let summary = summary_of(&[
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "http://collector.example.com:4318",
+            ),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "api-key=secret"),
+        ]);
+
+        assert!(summary.contains("OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4318"));
+        assert!(summary.contains("OTEL_EXPORTER_OTLP_PROTOCOL=grpc"));
+        assert!(summary.contains("OTEL_EXPORTER_OTLP_LOGS_HEADERS=<set>"));
+        assert!(!summary.contains("secret"));
     }
 }

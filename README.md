@@ -178,6 +178,38 @@ metrics::record_duration("llm.latency", Duration::from_millis(320), &[]);
 They never reach for an opentelemetry meter directly. That would make every crate that
 records a metric depend on opentelemetry whether or not the feature is on.
 
+### Testing against it
+
+Two pieces of state in this crate are process-global, and a test binary runs its tests in
+parallel threads of one process. Both bite the same way.
+
+**The registry.** `metrics::global()` is shared by every test in a binary, so two tests that
+record into it, or that reconfigure it, interfere. Build a `Registry` of your own with
+`Registry::new` and an injected clock; reach for the global only where the facade itself is
+what you are testing, and give that test a binary to itself. Tracked as
+[#6](https://github.com/adelie-ai/adelie-telemetry/issues/6).
+
+**The environment.** The `OTEL_*` variables are worse. `std::env::set_var` is `unsafe` in
+edition 2024 because `setenv` rewrites a shared array while any other thread may be reading
+it - so two tests that set *different* variables still race, and a comment claiming a test
+owns its variable is not a sound basis for the `unsafe` block. Do not test by mutating the
+environment. Inject the lookup instead, the same way this crate injects the clock, and read
+the variables once at the edge:
+
+```rust
+fn build(lookup: impl Fn(&str) -> Option<String>) -> Config { /* ... */ }
+
+// production
+build(|name| std::env::var(name).ok());
+
+// test - no unsafe, no lock, and every test runs in parallel
+build(|name| (name == "OTEL_EXPORTER_OTLP_PROTOCOL").then(|| "grpc".to_owned()));
+```
+
+Where a test genuinely must set a real variable - driving a whole process, say - put it in
+a child process instead, as `tests/acceptance_resilience.rs` does. A separate process has
+its own environment and cannot race this one.
+
 ### The registry runs with or without a collector
 
 With the `otel` feature off the facade does not no-op. It keeps counters and fixed-bucket
@@ -222,6 +254,69 @@ leak in a process that runs for weeks.
 
 **Label values are names, not content.** A prompt or a tool argument used as a label would
 be both a data leak and a memory leak. The cap limits the damage; it is not permission.
+
+## Putting a caller's value on a log line
+
+A tool name, a model name, an error quoting the input back: anything a caller can influence
+goes through `Safe` before it reaches a field.
+
+```rust
+use adelie_telemetry::Safe;
+
+tracing::info!(tool = %Safe::name(tool_name), "tool call finished");
+tracing::debug!(reason = %Safe::message(detail), "tool returned an error");
+```
+
+Without it, three things go wrong, and only the first is obvious:
+
+- A newline ends the log line and starts one that reads as a genuine record, with a real
+  timestamp column, level and target.
+- An ANSI escape survives. Turning the formatter's own colour off does not strip an escape
+  carried inside a value.
+- A bidi control reverses what the terminal shows without changing a byte, so the name in
+  `kubectl logs` is not the name that was called.
+
+And nothing bounds the length of a caller's value short of the transport's frame cap, which
+is measured in megabytes.
+
+### Which constructor
+
+| constructor | cap | for |
+|---|---|---|
+| `Safe::name` | 128 bytes | a tool, method, model or request id - short by nature |
+| `Safe::message` | 1024 bytes | a diagnostic, mostly your own text quoting the caller's |
+| `Safe::with_cap` | yours | a value that genuinely fits neither; say why at the call site |
+
+The shape is named rather than the number passed, because that is what stops the caps
+drifting apart across eighteen crates. `Safe::name`'s cap is the same limit the metrics
+facade puts on a label value, so one name reads the same way whichever signal you look at.
+
+### It costs nothing when nobody is looking
+
+Wrapping a value does no work. Sanitising happens inside `Display`, so a field at a level
+nobody enabled costs only the wrapper, and a field that is rendered goes straight into the
+formatter with no intermediate `String`.
+
+### It wraps anything, not just strings
+
+`Safe<T>` takes any `Display`. A JSON value implements `Display`, so it needs no second
+wrapper and this crate needs no JSON dependency:
+
+```rust
+tracing::debug!(arguments = %Safe::message(&json_value), "tool call arguments");
+```
+
+### One predicate, one place
+
+`Safe` and `metrics::Label::new` share the predicate. They have to: a value that read one
+way on a log line and another in a metrics summary would send an operator looking for a
+difference that is not there. `safe_and_label_agree_character_for_character` fails if they
+ever diverge, and it is the reason this lives in one crate rather than being copied per
+server.
+
+What is stripped: category Cc (C0, C1, DEL), U+2028 and U+2029, and the bidi controls
+U+061C, U+200E, U+200F, U+202A-U+202E and U+2066-U+2069. What is not: the rest of Cf,
+including the zero-width joiner that carries emoji sequences a person wants to read.
 
 ## Trace context
 
