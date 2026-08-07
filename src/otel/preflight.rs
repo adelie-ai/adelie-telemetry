@@ -27,7 +27,7 @@ const ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 ///
 /// Mirrors the resolution order the exporter uses: the per-signal variable, then the
 /// generic one, then the crate's compiled default, which is `http/protobuf`.
-fn resolves_to_grpc(signal_protocol_var: &str) -> bool {
+pub(crate) fn resolves_to_grpc(signal_protocol_var: &str) -> bool {
     for variable in [signal_protocol_var, PROTOCOL_VAR] {
         if let Ok(value) = std::env::var(variable) {
             let value = value.trim();

@@ -19,7 +19,6 @@
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::Instrument;
@@ -70,8 +69,7 @@ impl Pipelines {
             "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         )?;
-        let span_exporter = SpanExporter::builder()
-            .build()
+        let span_exporter = roots::traces_exporter("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
             .map_err(|error| pipeline_error("traces", &error))?;
         let traces = SdkTracerProvider::builder()
             .with_resource(resource.clone())
@@ -83,8 +81,7 @@ impl Pipelines {
             "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         )?;
-        let metric_exporter = MetricExporter::builder()
-            .build()
+        let metric_exporter = roots::metrics_exporter("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
             .map_err(|error| pipeline_error("metrics", &error))?;
         let metrics = SdkMeterProvider::builder()
             .with_resource(resource.clone())
@@ -97,8 +94,7 @@ impl Pipelines {
             "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
         )?;
-        let log_exporter = LogExporter::builder()
-            .build()
+        let log_exporter = roots::logs_exporter("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
             .map_err(|error| pipeline_error("logs", &error))?;
         let logs = SdkLoggerProvider::builder()
             .with_resource(resource)
@@ -244,6 +240,89 @@ pub(crate) fn build_duration_stream() -> Result<Stream, Box<dyn std::error::Erro
             record_min_max: true,
         })
         .build()
+}
+
+/// Exporter construction, and the trust anchors the gRPC transport verifies against.
+///
+/// The gRPC transport needs its roots passed in explicitly, and that is not obvious.
+/// `opentelemetry-otlp` builds its channel with a bare `ClientTlsConfig::new()` for an
+/// https endpoint, and tonic's root sets are opt-in booleans on that config which default
+/// to false. So a gRPC exporter left to itself verifies against **no roots at all** and
+/// rejects every certificate as `UnknownIssuer`, whichever `tls-*-roots` feature is
+/// compiled in. Enabling the feature is a no-op on its own; `with_enabled_roots` is what
+/// turns it on.
+///
+/// Only the gRPC path needs this. The HTTP path goes through reqwest, which uses
+/// `rustls-platform-verifier` and reads the operating system trust store by itself.
+#[cfg(feature = "otel-tls")]
+mod roots {
+    use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+    use opentelemetry_otlp::{
+        ExporterBuildError, LogExporter, MetricExporter, SpanExporter, WithTonicConfig,
+    };
+
+    fn trusted_roots() -> ClientTlsConfig {
+        ClientTlsConfig::new().with_enabled_roots()
+    }
+
+    /// Whether this signal resolves to the gRPC transport.
+    fn grpc(signal_protocol_var: &str) -> bool {
+        super::preflight::resolves_to_grpc(signal_protocol_var)
+    }
+
+    pub(super) fn traces_exporter(var: &str) -> Result<SpanExporter, ExporterBuildError> {
+        if grpc(var) {
+            SpanExporter::builder()
+                .with_tonic()
+                .with_tls_config(trusted_roots())
+                .build()
+        } else {
+            SpanExporter::builder().build()
+        }
+    }
+
+    pub(super) fn metrics_exporter(var: &str) -> Result<MetricExporter, ExporterBuildError> {
+        if grpc(var) {
+            MetricExporter::builder()
+                .with_tonic()
+                .with_tls_config(trusted_roots())
+                .build()
+        } else {
+            MetricExporter::builder().build()
+        }
+    }
+
+    pub(super) fn logs_exporter(var: &str) -> Result<LogExporter, ExporterBuildError> {
+        if grpc(var) {
+            LogExporter::builder()
+                .with_tonic()
+                .with_tls_config(trusted_roots())
+                .build()
+        } else {
+            LogExporter::builder().build()
+        }
+    }
+}
+
+/// Exporter construction for a build with no TLS backend.
+///
+/// There are no trust anchors to pass, and no `https` endpoint to use them on: the
+/// pre-flight check refuses one before it gets here.
+#[cfg(not(feature = "otel-tls"))]
+mod roots {
+    use opentelemetry_otlp::{ExporterBuildError, LogExporter, MetricExporter, SpanExporter};
+
+    pub(super) fn traces_exporter(_var: &str) -> Result<SpanExporter, ExporterBuildError> {
+        SpanExporter::builder().build()
+    }
+
+    pub(super) fn metrics_exporter(_var: &str) -> Result<MetricExporter, ExporterBuildError> {
+        MetricExporter::builder().build()
+    }
+
+    pub(super) fn logs_exporter(_var: &str) -> Result<LogExporter, ExporterBuildError> {
+        LogExporter::builder().build()
+    }
 }
 
 fn pipeline_error(signal: &'static str, error: &dyn std::fmt::Display) -> crate::Error {

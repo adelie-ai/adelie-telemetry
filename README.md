@@ -318,24 +318,53 @@ Both transports support `https`. TLS is on by default because telemetry carries 
 and a log line leaving the cluster in plaintext is a disclosure. Turning it off is
 deliberate, not accidental.
 
-### The two transports trust different certificate stores
+### Both transports read the OS trust store
 
-They do not share a TLS stack, and the difference decides what a container image needs.
+Neither bundles a root set. `grpc` uses tonic with the system roots; `http/protobuf` goes
+through reqwest and `rustls-platform-verifier`, which reads the same place.
 
-| transport | trust anchors | consequence |
-|---|---|---|
-| `grpc` | compiled-in webpki roots | independent of the image; works in a `FROM scratch` container |
-| `http/protobuf` | the OS trust store, through `rustls-platform-verifier` | the image needs `ca-certificates`, or every HTTPS export fails |
+Two consequences:
 
-Two things follow, and neither is obvious:
+- **A container needs a CA bundle.** Install `ca-certificates`, or every HTTPS export fails
+  on both transports. A `FROM scratch` or distroless image with no bundle cannot export
+  over HTTPS at all.
+- **A private certificate authority installed on the host just works**, on both transports,
+  with no code change and no rebuild.
 
-- **A container with no `ca-certificates` package has an empty OS trust store.** HTTPS over
-  `http/protobuf` fails there while the same endpoint over `grpc` succeeds. Install
-  `ca-certificates` in any image that exports over HTTPS, or use gRPC.
-- **A private certificate authority already installed on the host works over
-  `http/protobuf`**, because that path reads the OS store. It does not work over `grpc`,
-  which would need the `tls-roots` feature to read the system roots instead of the
-  compiled-in ones.
+#### gRPC needs its roots passed in, and that is not obvious
+
+`opentelemetry-otlp` builds its tonic channel with a bare `ClientTlsConfig::new()` for an
+`https` endpoint, and tonic's root sets are opt-in booleans on that config that default to
+false. A gRPC exporter left to itself therefore verifies against **no roots at all** and
+rejects every certificate as `UnknownIssuer` - whichever `tls-*-roots` feature is compiled
+in. Enabling the Cargo feature is a no-op by itself; `with_enabled_roots()` is what turns it
+on, and this crate calls it.
+
+That failure is worth recognising, because it reads like a certificate problem and is not:
+
+```text
+TonicTracesClient.ExportFailed grpc_code="Unavailable"
+  grpc_message="invalid peer certificate: UnknownIssuer"
+```
+
+If you see it against a collector whose certificate is otherwise fine, the roots were never
+loaded.
+
+#### Why the OS store rather than a bundled one
+
+A bundled root set - `webpki-roots` - was tried first and replaced. It can verify a public
+certificate perfectly well, and the reason for moving is not that it failed to:
+
+- It cannot see a certificate authority an administrator installed on the host, so a private
+  CA can never work with it.
+- It is a snapshot taken when that crate version was published, so it goes stale against CA
+  rotation and needs an upstream release plus a rebuild to catch up. `webpki-roots 1.0.9`,
+  the current release, carries `ISRG Root X1` and `X2` and no entry for the newer
+  `ISRG Root YR` that Let's Encrypt has begun issuing from.
+- Having one transport on bundled roots and the other on the OS store meant two answers to
+  every trust question.
+
+`scripts/no-bundled-roots.sh` fails the gate if a bundled root set comes back.
 
 ### The C toolchain, and opting out of it
 

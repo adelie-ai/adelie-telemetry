@@ -38,24 +38,34 @@ otel = [
 # anything: with `otel` off there is no otlp crate for it to apply to, and the
 # feature does nothing at all.
 # Each transport needs both a TLS provider and a set of trust anchors, and they do
-# not share either. `tls-webpki-roots` supplies anchors to tonic and no provider, so
-# gRPC over TLS fails to build without `tls-aws-lc` beside it. The provider costs
-# nothing here: reqwest already puts aws-lc-rs, rustls and tokio-rustls in the tree.
+# not share either. `tls-aws-lc` is the provider for tonic; without it gRPC over TLS
+# fails to build. The provider costs nothing here, because reqwest already puts
+# aws-lc-rs, rustls and tokio-rustls in the tree.
 #
-# The two transports end up trusting different stores, which is documented in the
-# README because it changes what a container image needs:
-#   gRPC  - compiled-in webpki roots, independent of the image.
-#   HTTP  - the OS trust store, via rustls-platform-verifier, so the image needs
-#           `ca-certificates` or every HTTPS export fails.
+# Both transports read the OPERATING SYSTEM trust store, and neither bundles a root
+# set. `tls-roots` gives tonic the system roots; reqwest reaches the same place
+# through rustls-platform-verifier. So a container needs a CA bundle
+# (`ca-certificates`), and a private CA installed on the host works with no code
+# change.
+#
+# This crate did bundle roots for gRPC, via `tls-webpki-roots`, and it broke: a valid
+# Let's Encrypt certificate chaining to ISRG Root YR was rejected as UnknownIssuer,
+# because webpki-roots 1.0.9 carries only ISRG Root X1 and X2. A bundled root set is
+# always one CA rotation away from that, and fixing it needs an upstream release plus
+# a rebuild. Do not reintroduce one; `scripts/no-bundled-roots.sh` fails the gate if
+# anything does.
+#
+# `reqwest-rustls` and NOT `reqwest-rustls-webpki-roots`: the latter enables
+# `reqwest/webpki-roots`, a feature reqwest no longer has. A feature requirement
+# travels to every consumer while a lockfile does not, so the effect was a silent cap
+# on every consumer's reqwest version, and an unresolvable graph as soon as anything
+# else needed a newer one.
 otel-tls = [
     "opentelemetry-otlp?/tls-aws-lc",
-    "opentelemetry-otlp?/tls-webpki-roots",
-    "opentelemetry-otlp?/reqwest-rustls-webpki-roots",
+    "opentelemetry-otlp?/tls-roots",
+    "opentelemetry-otlp?/reqwest-rustls",
 ]
 
-# Internal. Adds the SDK's in-memory exporter so a test can read back what the OTLP
-# path actually produced, instead of asserting a constant against itself. `just
-# check-otel` turns it on; nothing shipped depends on it.
 otel-testing = ["otel", "opentelemetry_sdk/testing"]
 
 [dependencies]
