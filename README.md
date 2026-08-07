@@ -339,8 +339,15 @@ Two things follow, and neither is obvious:
 
 ### The C toolchain, and opting out of it
 
-The TLS backend builds `aws-lc-rs`, which compiles native code and needs `cmake` and a C
-compiler. That is the one part of this crate with a build prerequisite beyond `cargo`.
+The TLS backend builds `aws-lc-rs`, which compiles native code. That is the one part of
+this crate with a build prerequisite beyond `cargo`.
+
+What it needs is a **C compiler and an assembler** - `build-essential` on Debian, or
+`gcc` plus `binutils` elsewhere. It does **not** need `cmake`: `aws-lc-sys` falls back to a
+cc-only build path when cmake is absent, and still produces its static library. Verified by
+putting a `cmake` that exits 127 first on `PATH` and building `--features otel` from clean,
+which succeeded. Asking for `cmake` in a builder image makes the requirement look heavier
+than it is.
 
 A build that cannot have a C dependency opts out:
 

@@ -34,7 +34,7 @@ test-otel:
 
 # The otel feature with the TLS backend left out, which is what a build that cannot
 # have a C dependency gets. `aws-lc-rs` compiles native code, so this configuration is
-# the one that has to keep working without cmake or a C compiler.
+# the one that has to keep working with no C compiler or assembler present.
 check-otel-no-tls:
     cargo clippy --all-targets --no-default-features --features otel -- -D warnings
     cargo build --no-default-features --features otel

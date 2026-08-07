@@ -12,7 +12,8 @@ repository = "https://github.com/adelie-ai/adelie-telemetry"
 # unless somebody deliberately says otherwise.
 #
 # The cost of that default is a C toolchain: rustls builds `aws-lc-rs`, which
-# compiles native code and needs cmake. A build that cannot have a C dependency
+# compiles native code and needs a C compiler and an assembler. A build that
+# cannot have a C dependency
 # takes `default-features = false` and loses only the ability to use an `https`
 # endpoint, which it is then told about by name rather than left to discover.
 default = ["otel-tls"]

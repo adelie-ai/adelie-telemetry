@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A build that opts out of the TLS backend must have no crate that compiles native
-# code. `aws-lc-rs` needs cmake and a C compiler, and a consumer takes
+# code. `aws-lc-rs` needs a C compiler and an assembler, and a consumer takes
 # `default-features = false` precisely to avoid that, so a crate sneaking back in
 # would silently break the reason the option exists.
 set -euo pipefail
