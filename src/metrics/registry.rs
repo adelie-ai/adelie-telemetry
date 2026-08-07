@@ -426,9 +426,24 @@ pub(crate) fn sanitize(value: String) -> String {
 ///
 /// Cf also holds U+200D ZERO WIDTH JOINER, which carries the emoji sequences a person
 /// legitimately wants to read. Hiding text is a weaker problem than reversing it, so the
-/// set stops at the characters that change reading order. It matches what `mcp-core`
-/// strips and what rustc's `text_direction_codepoint_in_literal` lint covers, so one
-/// answer holds across the fleet.
+/// set stops at the characters that change reading order.
+///
+/// The authority for the list is what `mcp-core` strips, so one answer holds across the
+/// fleet. That set is a **superset** of rustc's `text_direction_codepoint_in_literal`
+/// lint: it adds U+061C, U+200E and U+200F, the marks, to the lint's overrides, embeddings
+/// and isolates. The marks are included because a mark still changes reading order in a
+/// log line, which is the property this predicate is about. Do not narrow the list to the
+/// rustc lint on the grounds that the three marks are absent from it - they are absent
+/// deliberately.
+///
+/// # Reason from the categories, not from an attack
+///
+/// This predicate has been widened twice, and both times because it had been written
+/// against the attack in mind - line forgery - rather than against the character
+/// categories that make an attack possible. Cc breaks the line, Zl and Zp break the line
+/// in a JSON consumer, Cf reorders what is displayed. Check a new case against the
+/// categories, and the upper boundary against
+/// `a_zero_width_joiner_survives_the_sanitiser`, which fails if this widens to all of Cf.
 fn is_deceptive(character: char) -> bool {
     character.is_control()
         || matches!(
