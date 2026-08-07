@@ -174,9 +174,12 @@ fn metrics_cardinality_cap_is_per_metric() {
     );
 }
 
-/// The in-process path and the OTLP path report the same bucket boundaries.
+/// The in-process dump reports the shared bucket boundaries.
+///
+/// The half of the criterion that needs no collector. `histogram_buckets_match_otlp_export`
+/// in `src/otel/mod.rs` holds the other half, and compares the two paths directly.
 #[test]
-fn histogram_buckets_match_otlp_export() {
+fn histogram_buckets_are_the_shared_boundaries() {
     let (registry, _clock) = registry(Duration::from_secs(600), 64);
     registry.record_duration("llm.latency", Duration::from_millis(300), &[]);
 
@@ -336,6 +339,17 @@ fn label_value_cannot_forge_a_log_line() {
         !label.value().contains('\u{1b}'),
         "an ANSI escape survives with_ansi(false), which only disables the formatter's own colour"
     );
+
+    // char::is_control covers C0, C1 and DEL, but the Unicode line separators are
+    // categories Zl and Zp and slip past it. Every JSON consumer treats them as a break.
+    for separator in ['\u{2028}', '\u{2029}'] {
+        let label = Label::new("tool", format!("search{separator}forged"));
+        assert!(
+            !label.value().contains(separator),
+            "U+{:04X} is a line break to a JSON consumer and must not survive",
+            separator as u32
+        );
+    }
 
     // The readable part is kept, so sanitising does not destroy the diagnostic.
     assert!(label.value().starts_with("search"));

@@ -89,6 +89,26 @@ pub(crate) fn check(
     Ok(())
 }
 
+/// An endpoint with any userinfo removed.
+///
+/// `https://user:password@host:4318` is a documented way to authenticate to several OTLP
+/// backends, so the password is genuinely there to be printed. The same reasoning that
+/// keeps `OTEL_EXPORTER_OTLP_HEADERS` out of the log applies to it: this line goes to
+/// `kubectl logs`, and from there into the telemetry backend itself.
+fn redact_userinfo(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_owned();
+    };
+    // Userinfo ends at the first `@`, and only counts inside the authority, which ends at
+    // the first `/`, `?` or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://<redacted>@{host}{tail}"),
+        None => endpoint.to_owned(),
+    }
+}
+
 /// Whether a Tokio runtime is running on this thread.
 fn runtime_is_running() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
@@ -133,12 +153,19 @@ pub(crate) fn configuration_summary() -> String {
         "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
     ];
 
+    // Sanitised with the same function the metric labels use. These values come from a
+    // deployment overlay, and a YAML block scalar or a stray carriage return puts a line
+    // break in one by accident long before anybody does it on purpose. One forged line in
+    // `kubectl logs` reads exactly like a real one.
     let mut parts: Vec<String> = VALUE_VARS
         .iter()
         .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| format!("{name}={value}"))
+            std::env::var(name).ok().map(|value| {
+                format!(
+                    "{name}={}",
+                    crate::metrics::sanitize(redact_userinfo(&value))
+                )
+            })
         })
         .collect();
     parts.extend(
@@ -158,6 +185,71 @@ pub(crate) fn configuration_summary() -> String {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    /// A password in the endpoint must never be printed.
+    ///
+    /// Basic auth in the URL is a documented pattern for several OTLP backends, so the
+    /// value really does carry one.
+    #[test]
+    fn the_summary_redacts_credentials_in_an_endpoint() {
+        // SAFETY: this test owns this variable; no other test in this binary reads it.
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://svcuser:S3cretInUrl@collector.example.com:4318/v1/traces",
+            );
+        }
+        let summary = configuration_summary();
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        }
+
+        assert!(
+            !summary.contains("S3cretInUrl"),
+            "a password in the endpoint must not reach the log: {summary}"
+        );
+        assert!(!summary.contains("svcuser"));
+        assert!(
+            summary.contains("collector.example.com:4318"),
+            "the host must survive, or the report stops being useful: {summary}"
+        );
+        assert!(summary.contains("<redacted>"));
+    }
+
+    /// An endpoint without credentials is printed unchanged.
+    #[test]
+    fn the_summary_leaves_a_plain_endpoint_alone() {
+        assert_eq!(
+            redact_userinfo("https://collector.example.com:4318/v1/traces"),
+            "https://collector.example.com:4318/v1/traces"
+        );
+        assert_eq!(redact_userinfo("not-a-url"), "not-a-url");
+    }
+
+    /// An environment variable cannot forge a log line, for the same reason a metric
+    /// label cannot: the report goes into a log field, and a newline in a field ends the
+    /// line early.
+    #[test]
+    fn the_summary_cannot_forge_a_log_line() {
+        // SAFETY: this test owns this variable; no other test in this binary reads it.
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_COMPRESSION",
+                "gzip\n2026-08-07T00:00:00.000000Z  INFO probe: FORGED user=root",
+            );
+        }
+        let summary = configuration_summary();
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_COMPRESSION");
+        }
+
+        assert!(
+            !summary.contains('\n'),
+            "a newline would end the log line and start a forged one: {summary:?}"
+        );
+        assert!(!summary.contains('\u{2028}'));
+        assert!(summary.contains("gzip"), "the readable part must survive");
+    }
 
     /// A header value is a credential often enough that it is never printed.
     #[test]

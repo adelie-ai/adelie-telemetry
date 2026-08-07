@@ -32,6 +32,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 pub use histogram::{Bucket, DURATION_BUCKETS_MS, HistogramSnapshot};
+/// Used by the OTLP failure report, which is only compiled with the feature on.
+#[cfg(feature = "otel")]
+pub(crate) use registry::sanitize;
 pub use registry::{
     CounterSummary, DEFAULT_CARDINALITY_CAP, DEFAULT_DUMP_INTERVAL, HistogramSummary, Label,
     MAX_LABEL_VALUE_BYTES, OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE, Registry, Settings, Summary,

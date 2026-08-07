@@ -314,12 +314,28 @@ so `init` must be reached from inside a running runtime. Every Adelie daemon is 
 binary, so this holds in practice, but a small tool that calls `init` before starting a
 runtime must use the HTTP transport.
 
-Both transports support `https`, using the platform's publicly trusted roots. A collector
-behind a reverse proxy with a normal certificate needs no extra configuration. A private
-certificate authority is not trusted; that would need the `tls-roots` feature instead.
+Both transports support `https`. TLS is on by default because telemetry carries log lines,
+and a log line leaving the cluster in plaintext is a disclosure. Turning it off is
+deliberate, not accidental.
 
-TLS is on by default because telemetry carries log lines, and a log line leaving the
-cluster in plaintext is a disclosure. Turning it off is deliberate, not accidental.
+### The two transports trust different certificate stores
+
+They do not share a TLS stack, and the difference decides what a container image needs.
+
+| transport | trust anchors | consequence |
+|---|---|---|
+| `grpc` | compiled-in webpki roots | independent of the image; works in a `FROM scratch` container |
+| `http/protobuf` | the OS trust store, through `rustls-platform-verifier` | the image needs `ca-certificates`, or every HTTPS export fails |
+
+Two things follow, and neither is obvious:
+
+- **A container with no `ca-certificates` package has an empty OS trust store.** HTTPS over
+  `http/protobuf` fails there while the same endpoint over `grpc` succeeds. Install
+  `ca-certificates` in any image that exports over HTTPS, or use gRPC.
+- **A private certificate authority already installed on the host works over
+  `http/protobuf`**, because that path reads the OS store. It does not work over `grpc`,
+  which would need the `tls-roots` feature to read the system roots instead of the
+  compiled-in ones.
 
 ### The C toolchain, and opting out of it
 
@@ -340,6 +356,10 @@ What each configuration costs, counted with `cargo tree --edges normal`:
 | default features | 25 | none |
 | `--features otel` | 134 | `aws-lc-rs` |
 | `--no-default-features --features otel` | 119 | none |
+
+A release build pays for it in size and time as well: the `otlp_probe` example goes from
+1.13 MiB to 8.34 MiB, and a release build from 11s to 58s on a 36-thread machine. A CI
+builder with 2 to 4 cores will be several times slower again.
 
 A default build is unaffected either way: with `otel` off there is no OTLP crate for the
 TLS feature to apply to, so it does nothing. A desktop install from `cargo install` needs

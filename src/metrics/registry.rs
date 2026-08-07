@@ -384,11 +384,11 @@ pub(crate) fn emit(summary: &Summary) {
 ///
 /// Control characters are replaced rather than dropped, so the value still shows that
 /// something was there.
-fn sanitize(value: String) -> String {
+pub(crate) fn sanitize(value: String) -> String {
     let mut cleaned: String = value
         .chars()
         .map(|character| {
-            if character.is_control() || character == '\u{7f}' {
+            if is_line_breaking(character) {
                 REPLACEMENT
             } else {
                 character
@@ -405,6 +405,15 @@ fn sanitize(value: String) -> String {
         cleaned.truncate(end);
     }
     cleaned
+}
+
+/// Whether this character could end a log line or move a cursor.
+///
+/// `char::is_control` covers C0, C1 and DEL. It does not cover U+2028 LINE SEPARATOR or
+/// U+2029 PARAGRAPH SEPARATOR, which are categories Zl and Zp, and which some log viewers
+/// and every JSON consumer treat as a line break.
+fn is_line_breaking(character: char) -> bool {
+    character.is_control() || character == '\u{2028}' || character == '\u{2029}'
 }
 
 /// Labels as one `key=value,key=value` string.

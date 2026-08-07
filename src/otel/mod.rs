@@ -273,14 +273,18 @@ mod tests {
         );
     }
 
-    /// The exported histogram must carry the shared bucket boundaries.
+    /// The in-process path and the OTLP path report the same bucket boundaries.
     ///
-    /// Read back off a real export rather than compared against the constant the view was
-    /// built from. Asserting the constant equals itself passes even when the view matches
-    /// no instrument at all and every histogram silently falls back to the SDK defaults.
+    /// This is the acceptance criterion from `mcp-core#44`, and it carries the criterion's
+    /// name so a failing run says which requirement is unmet.
+    ///
+    /// The exported bounds are read back off a real export rather than compared against
+    /// the constant the view was built from. Asserting that the constant equals itself
+    /// passes even when the view matches no instrument at all and every histogram silently
+    /// falls back to the SDK defaults.
     #[cfg(feature = "otel-testing")]
     #[test]
-    fn otlp_export_carries_the_shared_bucket_boundaries() {
+    fn histogram_buckets_match_otlp_export() {
         use opentelemetry::KeyValue;
         use opentelemetry::metrics::MeterProvider as _;
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -320,13 +324,33 @@ mod tests {
             .next()
             .expect("one measurement was recorded");
 
+        let exported_bounds = point.bounds().collect::<Vec<f64>>();
         assert_eq!(
-            point.bounds().collect::<Vec<f64>>(),
+            exported_bounds,
             DURATION_BUCKETS_MS.to_vec(),
-            "the OTLP export must use the shared boundaries, or the two paths disagree \
-             about which bucket a measurement fell in"
+            "the OTLP export must use the shared boundaries"
         );
         assert_eq!(point.count(), 1);
+
+        // The other path, compared directly rather than assumed. The criterion is that the
+        // two agree, so the test has to hold both of them at once.
+        let registry = crate::metrics::Registry::new(
+            crate::metrics::Settings::default(),
+            std::sync::Arc::new(crate::clock::ManualClock::new()),
+        );
+        registry.record_duration("probe.latency", std::time::Duration::from_millis(320), &[]);
+        let in_process = registry.snapshot().histograms[0].total.bounds();
+
+        assert_eq!(
+            in_process,
+            exported_bounds
+                .iter()
+                .copied()
+                .chain(std::iter::once(f64::INFINITY))
+                .collect::<Vec<f64>>(),
+            "the in-process dump and the OTLP export must place a measurement in the same \
+             bucket; the dump adds the overflow bucket the OTLP form leaves implicit"
+        );
     }
 
     /// The view must select the instruments the facade creates.

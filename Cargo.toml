@@ -36,7 +36,18 @@ otel = [
 # own. That is what lets it sit in `default` without costing a default build
 # anything: with `otel` off there is no otlp crate for it to apply to, and the
 # feature does nothing at all.
+# Each transport needs both a TLS provider and a set of trust anchors, and they do
+# not share either. `tls-webpki-roots` supplies anchors to tonic and no provider, so
+# gRPC over TLS fails to build without `tls-aws-lc` beside it. The provider costs
+# nothing here: reqwest already puts aws-lc-rs, rustls and tokio-rustls in the tree.
+#
+# The two transports end up trusting different stores, which is documented in the
+# README because it changes what a container image needs:
+#   gRPC  - compiled-in webpki roots, independent of the image.
+#   HTTP  - the OS trust store, via rustls-platform-verifier, so the image needs
+#           `ca-certificates` or every HTTPS export fails.
 otel-tls = [
+    "opentelemetry-otlp?/tls-aws-lc",
     "opentelemetry-otlp?/tls-webpki-roots",
     "opentelemetry-otlp?/reqwest-rustls-webpki-roots",
 ]

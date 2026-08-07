@@ -213,3 +213,65 @@ fn a_build_without_tls_still_exports_over_plaintext() {
         "a plaintext endpoint needs no TLS backend. stderr was: {stderr}"
     );
 }
+
+/// gRPC over TLS must actually speak TLS, not merely compile.
+///
+/// `tls-webpki-roots` supplies tonic with trust anchors and no crypto provider, so a build
+/// carrying only that one refuses an `https` gRPC endpoint at exporter-build time and
+/// exports nothing at all. A constant saying a TLS backend exists is not evidence that a
+/// transport can use it, so this drives a real connection and looks at the bytes.
+///
+/// The handshake is not completed: the listener presents no certificate, and the webpki
+/// roots would not trust it. Reaching a TLS `ClientHello` is the whole assertion, because
+/// that is the step the missing provider prevented.
+#[cfg(feature = "otel-tls")]
+#[test]
+fn grpc_over_tls_reaches_a_tls_handshake() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener must bind");
+    let port = listener.local_addr().expect("the port is known").port();
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut first = [0u8; 8];
+            let read = stream.read(&mut first).unwrap_or(0);
+            let _ = sender.send(first[..read].to_vec());
+        }
+    });
+
+    let endpoint = format!("https://127.0.0.1:{port}");
+    let (stderr, success) = run_probe(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ("PROBE_RUNTIME", "tokio"),
+    ]);
+
+    assert!(success, "the probe must exit cleanly. stderr was: {stderr}");
+    assert!(
+        !stderr.contains("no TLS feature is enabled"),
+        "the gRPC transport needs a TLS provider as well as trust anchors, or an https \
+         endpoint is refused before a single connection is made. stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("telemetry export is off"),
+        "the pipeline must build. stderr was: {stderr}"
+    );
+
+    let bytes = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the exporter must open a connection to the endpoint");
+
+    assert!(
+        matches!(bytes.first(), Some(0x16)),
+        "the first byte must be a TLS handshake record, found {bytes:?}"
+    );
+    assert_eq!(
+        bytes.get(1),
+        Some(&0x03),
+        "a TLS ClientHello carries protocol version 3.x, found {bytes:?}"
+    );
+}
