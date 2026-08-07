@@ -22,7 +22,8 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
+use opentelemetry_sdk::metrics::Instrument;
+use opentelemetry_sdk::metrics::{Aggregation, InstrumentKind, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Level;
 use tracing_subscriber::Layer;
@@ -31,14 +32,6 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::metrics::DURATION_BUCKETS_MS;
-
-/// The name every duration histogram must end with for the shared bucket boundaries to
-/// apply to it.
-///
-/// Why a suffix rather than a list of names: this crate refuses to own any domain
-/// vocabulary, so it cannot enumerate the metrics a binary will record. A suffix lets a
-/// call site opt its metric into the shared boundaries by naming it well.
-pub const DURATION_METRIC_SUFFIX: &str = ".duration";
 
 /// The bucket boundaries the OTLP view is built from.
 ///
@@ -90,6 +83,11 @@ impl Pipelines {
 
         opentelemetry::global::set_tracer_provider(traces.clone());
         opentelemetry::global::set_meter_provider(metrics.clone());
+
+        // Any instrument built before that call is bound to the no-op meter provider and
+        // would record nothing for the rest of the process. A call site is allowed to
+        // record before the binary calls `init`, so drop them and let them be rebuilt.
+        crate::metrics::otel_bridge::reset_instruments();
 
         Ok(Self {
             traces,
@@ -147,8 +145,16 @@ impl Pipelines {
 }
 
 /// The view that gives every duration histogram the shared bucket boundaries.
+///
+/// It selects on the instrument's kind and unit rather than on its name. This crate
+/// refuses to own any domain vocabulary, so it cannot enumerate the metrics a binary will
+/// record, and a name convention would silently miss any metric that did not follow it.
+/// Every histogram the facade creates is a duration in milliseconds, so kind and unit
+/// identify exactly the right set.
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
-    if !instrument.name().ends_with(DURATION_METRIC_SUFFIX) {
+    if instrument.kind() != InstrumentKind::Histogram
+        || instrument.unit() != crate::metrics::otel_bridge::DURATION_UNIT
+    {
         return None;
     }
     build_duration_stream().ok()
@@ -196,10 +202,9 @@ mod tests {
         );
     }
 
-    /// The view applies to duration metrics and leaves everything else on its default.
+    /// The OTLP view is built from the same constant the in-process registry uses.
     #[test]
-    fn duration_view_selects_only_duration_metrics() {
+    fn otlp_view_uses_the_shared_bucket_boundaries() {
         assert_eq!(duration_bucket_boundaries(), DURATION_BUCKETS_MS.to_vec());
-        assert!(DURATION_METRIC_SUFFIX.starts_with('.'));
     }
 }

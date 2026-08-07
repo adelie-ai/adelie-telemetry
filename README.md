@@ -34,6 +34,284 @@ is additional, not a replacement, and is available behind an off-by-default Carg
 
 Anything outside that list belongs to the binary that needs it.
 
+## Use
+
+```toml
+[dependencies]
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry" }
+```
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = adelie_telemetry::init(adelie_telemetry::Config::new("adele-daemon"))?;
+    tracing::info!("started");
+    Ok(())
+}
+```
+
+Hold the guard for as long as the process should report. Dropping it flushes.
+
+A library must never call `init`. The binary owns the subscriber. A second call in one
+process is a no-op that returns an inert guard, so a library hosted in another binary
+cannot break it by trying.
+
+## Logging
+
+### Where it goes
+
+**stderr, always.** Never stdout. The MCP stdio transport frames JSON-RPC on stdout, so one
+log line there corrupts the protocol stream, and `adele-tui` writes the model reply there
+in `--prompt` mode.
+
+Console output is plain text, not JSON. With a collector doing the real collection, stderr
+is for a person reading `kubectl logs` or `journalctl`, and plain text is easier to read.
+Colour is off, so escape codes do not end up in a log file.
+
+### How much of it
+
+`RUST_LOG` sets the filter, through `EnvFilter`. When it is unset or unparseable, the
+config's default filter applies, which is `info` unless the binary chose otherwise.
+
+```sh
+RUST_LOG=debug ./adele-daemon
+RUST_LOG=info,adelie_telemetry=warn ./adele-daemon
+```
+
+One filter governs the console and the OTLP log exporter together. An operator who turns
+the verbosity up expects the same lines wherever they read them, and a second filter would
+mean two answers to "why is this line missing".
+
+### What may appear at each level
+
+This contract is a rule, not a preference.
+
+| Level | Carries |
+|---|---|
+| INFO | ids, counts, durations, model names, token counts. **Never content.** |
+| DEBUG | prompts, the assembled context, tool arguments. |
+
+`RUST_LOG=debug` therefore means conversation content reaches the collector. That is
+deliberate, and it is the reason the default is `info`.
+
+### Span timing
+
+`Config::with_span_close_events(true)` writes a line when a span closes, carrying how long
+it was open:
+
+```text
+INFO turn{turn_id=4bf92f35...}: close time.busy=208µs time.idle=14.9ms
+```
+
+This is what makes turn timing visible to somebody reading a running container's log, where
+there is no trace backend to open. It is noisy under a debug filter, so it is off by
+default and each binary chooses.
+
+## Metrics
+
+Call sites use the facade and nothing else:
+
+```rust
+use adelie_telemetry::metrics::{self, Label};
+use std::time::Duration;
+
+metrics::increment("llm.requests", &[Label::new("provider", "example")]);
+metrics::add("llm.tokens.input", 1_234, &[Label::new("model", "example-model")]);
+metrics::record_duration("llm.latency", Duration::from_millis(320), &[]);
+```
+
+They never reach for an opentelemetry meter directly. That would make every crate that
+records a metric depend on opentelemetry whether or not the feature is on.
+
+### The registry runs with or without a collector
+
+With the `otel` feature off the facade does not no-op. It keeps counters and fixed-bucket
+histograms in process and writes a summary periodically, so metrics behave the way logs and
+traces already do: local by default, exported additionally. A desktop install running a
+default-feature build from `cargo install` gets real numbers in its journal.
+
+The summary keeps running when a collector *is* configured, and the two paths report over
+the same bucket boundaries, so the local dump cross-checks the exported one.
+
+`Config::with_metrics_dump_interval` sets how often. The default is 10 minutes.
+`Duration::ZERO` turns the summary off; the registry still accumulates.
+
+Each summary reports the window that just closed beside a running total:
+
+```text
+INFO metrics summary window_seconds=600 uptime_seconds=8400 counters=4 histograms=2
+INFO counter metric="llm.requests" labels=provider=example window=41 total=612
+INFO duration metric="llm.latency" labels= window_count=41 window_p95_ms=2500 total_count=612 total_p95_ms=5000
+```
+
+On a pod that has run for a month, a cumulative number is dominated by history and stops
+moving, so a fault that started an hour ago is invisible in it. The window shows what is
+happening now.
+
+### Buckets, not means
+
+Durations go into fixed-bucket histograms, from 1 ms to 5 minutes. A mean hides the tail:
+"the average turn took 3 seconds" and "one turn in twenty took four minutes" are the same
+mean, and only the second one is the report a user files. The same boundaries feed the OTLP
+view, so both paths agree about which bucket a measurement fell in.
+
+### Cardinality
+
+One metric may have 64 distinct label sets by default. Past that, further label sets fold
+into one series labelled `cardinality=other`, and the registry stops growing. Measurements
+are still counted; only the labels are lost. A label taken from a model, tool or provider
+name is config-controlled in practice, and an unbounded label set is an unbounded memory
+leak in a process that runs for weeks.
+
+`Config::with_cardinality_cap` changes the limit.
+
+**Label values are names, not content.** A prompt or a tool argument used as a label would
+be both a data leak and a memory leak. The cap limits the damage; it is not permission.
+
+## Trace context
+
+The helpers are free functions. They need no `Config`, no `init` and no `Guard`, and they
+work with the `otel` feature off, so a desktop client that exports nothing can still mint
+the id a daemon adopts.
+
+```rust
+use adelie_telemetry::trace_context::{self, TraceOrigin};
+
+// A uuid is 16 bytes and a W3C trace id is 16 bytes, so a request id becomes the trace
+// id directly. Pass `uuid.into_bytes()`.
+let request_id = [7u8; 16];
+
+match trace_context::resolve_trace(incoming_traceparent, request_id)? {
+    TraceOrigin::Continued(parent) => { /* join the caller's trace */ }
+    TraceOrigin::Minted(trace_id)  => { /* this process is the root */ }
+}
+# Ok::<(), adelie_telemetry::TraceContextError>(())
+```
+
+An incoming `traceparent` always wins. A malformed one is an error rather than a silent
+fall back to minting, because minting would split one turn across two traces without
+saying so.
+
+`TraceParent::root_for` builds a header for a process that has no spans of its own, which
+is what a client built without the `otel` feature needs in order to start a trace at all.
+
+The all-zero trace id and span id are the spec's "invalid" sentinels and are rejected.
+
+## OpenTelemetry export
+
+Off by default:
+
+```toml
+adelie-telemetry = { git = "...", features = ["otel"] }
+```
+
+With the feature off, no opentelemetry crate is resolved at all. With it on, the OTLP
+layers are added beside the console layer rather than in place of it, so an exporting build
+still prints locally.
+
+### Configuration
+
+Everything comes from the standard `OTEL_*` environment variables. There are no CLI flags
+and no Adelie-specific variables. This crate passes nothing to the exporter builders, so
+every variable below reaches them.
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Endpoint for all three signals. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Endpoint for traces. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Endpoint for metrics. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Endpoint for log records. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc`, `http/protobuf` or `http/json`, for all three. |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Protocol for traces. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | Protocol for metrics. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Protocol for log records. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Headers for all three, as `key=value,key=value`. |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Headers for traces. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Headers for metrics. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Headers for log records. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds, for all three. |
+| `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Timeout for traces. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Timeout for metrics. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Timeout for log records. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd`, for all three. Per-signal forms exist too. |
+| `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value`. |
+
+A per-signal variable beats the generic one. The generic endpoint has the signal's path
+appended to it (`/v1/traces` and so on); a per-signal endpoint is used exactly as written,
+so it must include the path.
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  ./adele-daemon
+```
+
+### Choosing a transport
+
+Both transports are compiled in, and `OTEL_EXPORTER_OTLP_PROTOCOL` selects one at run time.
+
+**`http/protobuf` (port 4318) is the safer default.** It uses a blocking HTTP client on the
+exporter's own thread and needs nothing from the process.
+
+**`grpc` (port 4317) needs a Tokio runtime.** The exporter's transport calls into a reactor,
+so `init` must be reached from inside a running runtime. Every Adelie daemon is a Tokio
+binary, so this holds in practice, but a small tool that calls `init` before starting a
+runtime must use the HTTP transport.
+
+Neither transport is compiled with a TLS backend, so an `https` endpoint is not supported
+yet. In-cluster collectors are reached over plaintext on the node-local network.
+
+### Which pipeline owns an event
+
+`tracing-opentelemetry` turns an event inside a span into a span event, and
+`opentelemetry-appender-tracing` exports the same event as a log record. Left alone, both
+happen and every event is counted twice.
+
+**The log pipeline wins.** The trace layer is filtered down to spans, so an event reaches
+the backend exactly once, as a log record. The log record is the complete one:
+`tracing-opentelemetry` silently drops any event with no span open around it, so a pipeline
+built on span events would lose every event emitted outside a span without saying so.
+
+The one exception is `ERROR`. The trace layer sets a span's status to failed when it sees an
+error event, and that status is what stops a failed turn looking green in a trace view.
+Error events therefore reach both, and are the only events that appear twice.
+
+### Shutdown
+
+`init` returns a `Guard`. Dropping it flushes and shuts down traces, metrics and logs, in
+that order, and writes one final metrics summary. The batch exporters buffer, and a process
+that exits without a flush loses whatever was still in the buffer, which is usually the part
+worth having, because a crash is what was being investigated.
+
+## Development
+
+```sh
+just check       # format, clippy, build, test, and the no-opentelemetry check
+just check-otel  # the same build and tests with --features otel
+just check-all   # both. This is what the pre-push hook runs.
+just install-hooks
+```
+
+Both configurations are part of the gate. A change that compiles with default features can
+still fail with `otel` on.
+
+### Checking against a real collector
+
+```sh
+podman run -d --name otelcol -p 4317:4317 -p 4318:4318 \
+  -v ./collector.yaml:/etc/otelcol/config.yaml:z \
+  docker.io/otel/opentelemetry-collector-contrib:0.144.0 --config /etc/otelcol/config.yaml
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  cargo run --features otel --example otlp_probe
+
+podman logs otelcol
+```
+
+The probe emits two nested spans, three metrics and four log records. Set
+`PROBE_RUNTIME=tokio` to run it inside a Tokio runtime, which the gRPC transport needs.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

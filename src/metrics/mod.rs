@@ -24,6 +24,8 @@
 //! memory leak. The cardinality cap limits the damage; it is not permission.
 
 mod histogram;
+#[cfg(feature = "otel")]
+pub(crate) mod otel_bridge;
 mod registry;
 
 use std::sync::{Arc, LazyLock};

@@ -208,14 +208,24 @@ impl Registry {
 
     /// Add to a counter.
     pub fn add(&self, name: &'static str, value: u64, labels: &[Label]) {
-        let mut inner = self.lock();
-        let key = inner.key_for(name, labels, Instrument::Counter);
-        let series = inner.counters.entry(key).or_insert(CounterSeries {
-            total: 0,
-            window: 0,
-        });
-        series.total = series.total.saturating_add(value);
-        series.window = series.window.saturating_add(value);
+        let resolved = {
+            let mut inner = self.lock();
+            let key = inner.key_for(name, labels, Instrument::Counter);
+            let series = inner.counters.entry(key.clone()).or_insert(CounterSeries {
+                total: 0,
+                window: 0,
+            });
+            series.total = series.total.saturating_add(value);
+            series.window = series.window.saturating_add(value);
+            key
+        };
+
+        // The lock is released first. The OTLP path is another process's problem once the
+        // measurement is buffered, but it is not this lock's problem at all.
+        #[cfg(feature = "otel")]
+        crate::metrics::otel_bridge::add(resolved.name, value, &resolved.labels);
+        #[cfg(not(feature = "otel"))]
+        let _ = resolved;
     }
 
     /// Add one to a counter.
@@ -225,17 +235,29 @@ impl Registry {
 
     /// Record one duration measurement.
     pub fn record_duration(&self, name: &'static str, value: Duration, labels: &[Label]) {
-        let mut inner = self.lock();
-        let key = inner.key_for(name, labels, Instrument::Histogram);
-        let series = inner
-            .histograms
-            .entry(key)
-            .or_insert_with(|| HistogramSeries {
-                total: Histogram::new(DURATION_BUCKETS_MS),
-                window: Histogram::new(DURATION_BUCKETS_MS),
-            });
-        series.total.record(value);
-        series.window.record(value);
+        let resolved = {
+            let mut inner = self.lock();
+            let key = inner.key_for(name, labels, Instrument::Histogram);
+            let series = inner
+                .histograms
+                .entry(key.clone())
+                .or_insert_with(|| HistogramSeries {
+                    total: Histogram::new(DURATION_BUCKETS_MS),
+                    window: Histogram::new(DURATION_BUCKETS_MS),
+                });
+            series.total.record(value);
+            series.window.record(value);
+            key
+        };
+
+        #[cfg(feature = "otel")]
+        crate::metrics::otel_bridge::record_duration_ms(
+            resolved.name,
+            value.as_secs_f64() * 1_000.0,
+            &resolved.labels,
+        );
+        #[cfg(not(feature = "otel"))]
+        let _ = resolved;
     }
 
     /// Everything recorded so far, leaving the window open.

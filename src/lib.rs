@@ -72,9 +72,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub use config::{Config, DEFAULT_FILTER};
 pub use guard::Guard;
 #[cfg(feature = "otel")]
-pub use otel::{
-    DURATION_METRIC_SUFFIX, duration_bucket_boundaries as otel_duration_bucket_boundaries,
-};
+pub use otel::duration_bucket_boundaries as otel_duration_bucket_boundaries;
 pub use trace_context::{
     SpanId, TraceContextError, TraceId, TraceOrigin, TraceParent, extract_traceparent,
     inject_traceparent, resolve_trace, trace_id_from_uuid,
