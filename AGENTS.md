@@ -15,19 +15,29 @@ A binary calls `init` or nothing happens.
 Warnings are denied mechanically - `[lints] rust.warnings = "deny"` and `clippy.all = "deny"`
 in `Cargo.toml` - so `cargo build` / `test` / `clippy` hard-fail on any warning.
 
-## The two configurations
+## The three configurations
 
-The crate ships in two shapes, and both are load-bearing.
+The crate ships in three shapes, and all of them are load-bearing.
 
 - **Default features.** No opentelemetry crate is resolved at all. Console logging works,
   the metrics registry accumulates and dumps, and the trace-context helpers return real
   ids. This is what a desktop install from `cargo install` gets.
 - **`--features otel`.** The OTLP layers are added *beside* the console layer, never in
-  place of it, so an exporting build still prints locally.
+  place of it, so an exporting build still prints locally. TLS comes with it, from the
+  default features.
+- **`--no-default-features --features otel`.** Export without a TLS backend, and so without
+  a crate that compiles native code. This is for a build that cannot host a C toolchain.
+  It loses `https` and nothing else.
 
-Every change is verified in both. A new optional dependency stays behind the `otel`
+Every change is verified in all three. A new optional dependency stays behind the `otel`
 feature; a dependency that a default build resolves is a change to what the whole fleet
-compiles, and needs to be justified as such.
+compiles, and needs to be justified as such. A dependency that compiles native code must
+stay out of the first and third, which `scripts/no-c-deps.sh` enforces.
+
+Each transport needs a TLS provider *and* trust anchors, and they are separate Cargo
+features that do not imply each other. Trust anchors alone compile cleanly and then refuse
+every `https` endpoint at run time, so a change to the TLS features is checked by running
+`grpc_over_tls_reaches_a_tls_handshake`, not by reading the manifest.
 
 ## Rust conventions
 
@@ -55,8 +65,10 @@ The `adelie-ai` repos have no CI. The gate is local and the author runs it:
 
 - `just check` - format, clippy, build and test with default features, plus a scripted
   check that no opentelemetry crate is resolved.
-- `just check-otel` - clippy, build and test with `--features otel`.
-- `just check-all` - both. This is what the pre-push hook runs; wire it with
+- `just check-otel` - clippy, build and test with the `otel` feature and TLS.
+- `just check-otel-no-tls` - the same without the TLS backend, plus a scripted check that
+  no crate compiling native code is resolved.
+- `just check-all` - all three. This is what the pre-push hook runs; wire it with
   `just install-hooks`.
 
 The `[lints]` table denies warnings mechanically as well, so a plain `cargo build` or

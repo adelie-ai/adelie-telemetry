@@ -27,11 +27,22 @@ lint-otel:
     cargo clippy --all-targets --features otel -- -D warnings
 build-otel:
     cargo build --features otel
+# `otel-testing` adds the SDK in-memory exporter the histogram-bucket test reads back
+# from. It is a superset of `otel`, so this covers the shipped configuration too.
 test-otel:
-    cargo test --features otel
+    cargo test --features otel-testing
 
-# Both configurations. This is what the pre-push hook runs.
-check-all: check check-otel
+# The otel feature with the TLS backend left out, which is what a build that cannot
+# have a C dependency gets. `aws-lc-rs` compiles native code, so this configuration is
+# the one that has to keep working with no C compiler or assembler present.
+check-otel-no-tls:
+    cargo clippy --all-targets --no-default-features --features otel -- -D warnings
+    cargo build --no-default-features --features otel
+    cargo test --no-default-features --features otel
+    ./scripts/no-c-deps.sh
+
+# Every configuration the crate ships in. This is what the pre-push hook runs.
+check-all: check check-otel check-otel-no-tls
 
 # A default-feature build must pull in no opentelemetry crate.
 no-otel-default:

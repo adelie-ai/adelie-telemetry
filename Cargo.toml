@@ -6,7 +6,90 @@ license = "Apache-2.0"
 description = "Shared telemetry setup for the Adelie Rust fleet: subscriber construction, the OTLP trace, metric and log pipelines, an in-process metrics registry, a shutdown guard, and trace-context helpers."
 repository = "https://github.com/adelie-ai/adelie-telemetry"
 
+[features]
+# TLS is on by default, and opting out is what turns it off. Telemetry carries log
+# lines, so the transport to a collector outside the cluster should be encrypted
+# unless somebody deliberately says otherwise.
+#
+# The cost of that default is a C toolchain: rustls builds `aws-lc-rs`, which
+# compiles native code and needs a C compiler and an assembler. A build that
+# cannot have a C dependency
+# takes `default-features = false` and loses only the ability to use an `https`
+# endpoint, which it is then told about by name rather than left to discover.
+default = ["otel-tls"]
+
+# Off by default. With `otel` off the crate resolves no opentelemetry crate at
+# all, so a desktop install from `cargo install` pays nothing for it. With
+# `otel` on, the OTLP layers are added beside the console layer, never in place
+# of it, so an exporting build still prints locally.
+otel = [
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-appender-tracing",
+    "dep:tokio",
+]
+
+# The TLS backend, kept as its own feature so the code can ask whether it is there.
+#
+# Every reference uses `?`, so this feature never pulls opentelemetry-otlp in on its
+# own. That is what lets it sit in `default` without costing a default build
+# anything: with `otel` off there is no otlp crate for it to apply to, and the
+# feature does nothing at all.
+# Each transport needs both a TLS provider and a set of trust anchors, and they do
+# not share either. `tls-webpki-roots` supplies anchors to tonic and no provider, so
+# gRPC over TLS fails to build without `tls-aws-lc` beside it. The provider costs
+# nothing here: reqwest already puts aws-lc-rs, rustls and tokio-rustls in the tree.
+#
+# The two transports end up trusting different stores, which is documented in the
+# README because it changes what a container image needs:
+#   gRPC  - compiled-in webpki roots, independent of the image.
+#   HTTP  - the OS trust store, via rustls-platform-verifier, so the image needs
+#           `ca-certificates` or every HTTPS export fails.
+otel-tls = [
+    "opentelemetry-otlp?/tls-aws-lc",
+    "opentelemetry-otlp?/tls-webpki-roots",
+    "opentelemetry-otlp?/reqwest-rustls-webpki-roots",
+]
+
+# Internal. Adds the SDK's in-memory exporter so a test can read back what the OTLP
+# path actually produced, instead of asserting a constant against itself. `just
+# check-otel` turns it on; nothing shipped depends on it.
+otel-testing = ["otel", "opentelemetry_sdk/testing"]
+
 [dependencies]
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# The opentelemetry 0.x crates version-lock as a set. Bump them together.
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry-appender-tracing = { version = "0.32.0", optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+
+opentelemetry_sdk = { version = "0.32.1", optional = true }
+
+# `rt` only, to ask whether a Tokio runtime is running. The gRPC transport needs one
+# and panics from inside hyper without it, so the question has to be asked before the
+# exporter is built. `grpc-tonic` already pulls tokio in, so this adds no crate.
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt",
+], optional = true }
+
+# Both transports are compiled in so that OTEL_EXPORTER_OTLP_PROTOCOL selects
+# one at run time. `http-proto` reaches a collector on 4318 and `grpc-tonic`
+# reaches one on 4317. The exporter builders only consult the variable when
+# neither transport was chosen in code, and a transport that is not compiled in
+# cannot be selected at all, so compiling one would make the documented variable
+# a lie for half its values.
+#
+# TLS comes from the `otel-tls` feature rather than from here, so the code can tell
+# whether a TLS backend is compiled in. Publicly trusted roots only; a private CA would
+# need `tls-roots` instead.
+opentelemetry-otlp = { version = "0.32.0", features = [
+    "grpc-tonic",
+], optional = true }
 
 [lints.rust]
 warnings = "deny"
@@ -33,3 +116,6 @@ opt-level = "z"
 lto = "fat"
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
