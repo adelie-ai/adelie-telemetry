@@ -158,26 +158,58 @@ fn grpc_inside_a_runtime_is_accepted() {
     );
 }
 
-/// An `https` endpoint must be usable, not refused.
+/// An `https` endpoint works, or is refused by name. Never anything in between.
 ///
-/// The refusal path, for a build with no TLS backend, is covered by the unit tests in
-/// `src/otel/preflight.rs`. This one holds the promise that the shipped build never takes
-/// it.
+/// TLS ships in the default features, so a normal build reaches an https collector. A
+/// build that took `default-features = false` has no TLS backend, and must say so: the
+/// alternative is reaching the socket and failing with "network error", which sends an
+/// operator to debug DNS and firewalls for a problem that is neither.
 #[test]
-fn https_endpoints_are_accepted_by_the_shipped_build() {
+fn https_is_either_usable_or_refused_by_name() {
     let (stderr, success) = run_probe(&[(
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "https://collector.example.com:4318",
     )]);
 
     assert!(success, "the process must not die. stderr was: {stderr}");
-    assert!(
-        !stderr.contains("no TLS backend"),
-        "the otel feature compiles a TLS backend, so an https endpoint must be accepted \
-         rather than refused. stderr was: {stderr}"
-    );
+
+    if cfg!(feature = "otel-tls") {
+        assert!(
+            !stderr.contains("no TLS backend"),
+            "the default features include TLS, so an https endpoint must be accepted. \
+             stderr was: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("no TLS backend"),
+            "without TLS the refusal must name the cause, not look like a network fault. \
+             stderr was: {stderr}"
+        );
+        assert!(
+            stderr.contains("default-features"),
+            "the refusal must name what to change. stderr was: {stderr}"
+        );
+    }
+
     assert!(
         stderr.contains("a line that must still reach the console"),
-        "console logging must survive an unreachable collector. stderr was: {stderr}"
+        "console logging must survive either way. stderr was: {stderr}"
+    );
+}
+
+/// A build without TLS still exports over plaintext.
+///
+/// Dropping the TLS backend must cost only `https`, not telemetry altogether.
+#[test]
+fn a_build_without_tls_still_exports_over_plaintext() {
+    let (stderr, success) = run_probe(&[(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://collector.example.com:4318",
+    )]);
+
+    assert!(success);
+    assert!(
+        !stderr.contains("telemetry export is off"),
+        "a plaintext endpoint needs no TLS backend. stderr was: {stderr}"
     );
 }

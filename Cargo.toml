@@ -7,6 +7,16 @@ description = "Shared telemetry setup for the Adelie Rust fleet: subscriber cons
 repository = "https://github.com/adelie-ai/adelie-telemetry"
 
 [features]
+# TLS is on by default, and opting out is what turns it off. Telemetry carries log
+# lines, so the transport to a collector outside the cluster should be encrypted
+# unless somebody deliberately says otherwise.
+#
+# The cost of that default is a C toolchain: rustls builds `aws-lc-rs`, which
+# compiles native code and needs cmake. A build that cannot have a C dependency
+# takes `default-features = false` and loses only the ability to use an `https`
+# endpoint, which it is then told about by name rather than left to discover.
+default = ["otel-tls"]
+
 # Off by default. With `otel` off the crate resolves no opentelemetry crate at
 # all, so a desktop install from `cargo install` pays nothing for it. With
 # `otel` on, the OTLP layers are added beside the console layer, never in place
@@ -18,15 +28,17 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-appender-tracing",
     "dep:tokio",
-    "otel-tls",
 ]
 
 # The TLS backend, kept as its own feature so the code can ask whether it is there.
-# `otel` always turns it on, so every shipped build can reach an https collector. It
-# costs a C toolchain and cmake at build time, because rustls pulls aws-lc-rs.
+#
+# Every reference uses `?`, so this feature never pulls opentelemetry-otlp in on its
+# own. That is what lets it sit in `default` without costing a default build
+# anything: with `otel` off there is no otlp crate for it to apply to, and the
+# feature does nothing at all.
 otel-tls = [
-    "opentelemetry-otlp/tls-webpki-roots",
-    "opentelemetry-otlp/reqwest-rustls-webpki-roots",
+    "opentelemetry-otlp?/tls-webpki-roots",
+    "opentelemetry-otlp?/reqwest-rustls-webpki-roots",
 ]
 
 # Internal. Adds the SDK's in-memory exporter so a test can read back what the OTLP

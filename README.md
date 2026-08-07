@@ -318,9 +318,46 @@ Both transports support `https`, using the platform's publicly trusted roots. A 
 behind a reverse proxy with a normal certificate needs no extra configuration. A private
 certificate authority is not trusted; that would need the `tls-roots` feature instead.
 
-**Build prerequisite:** `--features otel` needs `cmake` and a C compiler, because the TLS
-stack builds `aws-lc-rs` from source. A default-feature build needs neither, so a desktop
-install from `cargo install` is unaffected.
+TLS is on by default because telemetry carries log lines, and a log line leaving the
+cluster in plaintext is a disclosure. Turning it off is deliberate, not accidental.
+
+### The C toolchain, and opting out of it
+
+The TLS backend builds `aws-lc-rs`, which compiles native code and needs `cmake` and a C
+compiler. That is the one part of this crate with a build prerequisite beyond `cargo`.
+
+A build that cannot have a C dependency opts out:
+
+```toml
+[dependencies]
+adelie-telemetry = { git = "...", default-features = false }
+```
+
+What each configuration costs, counted with `cargo tree --edges normal`:
+
+| configuration | crates | native code |
+|---|---|---|
+| default features | 25 | none |
+| `--features otel` | 134 | `aws-lc-rs` |
+| `--no-default-features --features otel` | 119 | none |
+
+A default build is unaffected either way: with `otel` off there is no OTLP crate for the
+TLS feature to apply to, so it does nothing. A desktop install from `cargo install` needs
+no C toolchain.
+
+Opting out costs exactly one thing: an `https` endpoint stops working. It is refused at
+`init` by name, so it fails as a configuration error rather than as a network fault:
+
+```text
+ERROR telemetry export is off for this process; console logging and the metrics summary
+are unaffected error=could not build the OTLP traces pipeline: OTEL_EXPORTER_OTLP_ENDPOINT
+uses https, and this build has no TLS backend compiled in. Something took
+`default-features = false` on adelie-telemetry, and the TLS backend is one of those
+defaults. Use an http endpoint, or restore the default features
+```
+
+Plaintext export is unaffected, so an in-cluster collector on the node-local network works
+in either configuration.
 
 ### Which pipeline owns an event
 
@@ -371,9 +408,15 @@ just check-all   # both. This is what the pre-push hook runs.
 just install-hooks
 ```
 
-`check-otel` builds with `otel-testing`, which adds the SDK's in-memory exporter so a test
-can read back what the OTLP path really produced. It is a superset of `otel`, so the
-shipped configuration is covered by the same run.
+The crate ships in three configurations and the gate covers all three:
+
+- `check` - default features. No opentelemetry crate is resolved at all.
+- `check-otel` - export on, TLS on. Built with `otel-testing`, which adds the SDK's
+  in-memory exporter so a test can read back what the OTLP path really produced. It is a
+  superset of `otel`, so the shipped configuration is covered by the same run.
+- `check-otel-no-tls` - export on, TLS off. This is what a consumer that took
+  `default-features = false` gets, and `scripts/no-c-deps.sh` holds the line that it
+  resolves no crate which compiles native code.
 
 Both configurations are part of the gate. A change that compiles with default features can
 still fail with `otel` on.

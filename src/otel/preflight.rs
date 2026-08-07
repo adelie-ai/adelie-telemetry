@@ -8,17 +8,11 @@ use crate::Error;
 
 /// Whether a TLS backend is compiled in.
 ///
-/// Without one an `https` endpoint cannot work at all. The exporter fails closed rather
-/// than falling back to plaintext, so nothing leaks; it just fails for a reason that
-/// reads like a network fault.
+/// On unless the consumer took `default-features = false`. Without one an `https`
+/// endpoint cannot work at all. The exporter fails closed rather than falling back to
+/// plaintext, so nothing leaks; it just fails for a reason that reads like a network
+/// fault, which is why [`check`] refuses it by name first.
 pub const TLS_AVAILABLE: bool = cfg!(feature = "otel-tls");
-
-/// The `otel` feature must compile a TLS backend, or an https collector is unreachable.
-///
-/// Checked when the crate compiles rather than when a test runs, so removing the TLS
-/// feature from `otel` breaks the build instead of quietly making every https endpoint
-/// fail at run time.
-const _: () = assert!(TLS_AVAILABLE);
 
 /// The value of `OTEL_EXPORTER_OTLP_PROTOCOL` that selects gRPC.
 const PROTOCOL_GRPC: &str = "grpc";
@@ -84,8 +78,10 @@ pub(crate) fn check(
         return Err(Error::Pipeline {
             signal,
             message: format!(
-                "{ENDPOINT_VAR} uses https, and this build has no TLS backend compiled in. \
-                 Use an http endpoint, or build with a TLS feature enabled"
+                "{ENDPOINT_VAR} uses https, and this build has no TLS backend compiled \
+                 in. Something took `default-features = false` on adelie-telemetry, and \
+                 the TLS backend is one of those defaults. Use an http endpoint, or \
+                 restore the default features"
             ),
         });
     }

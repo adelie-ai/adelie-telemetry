@@ -32,8 +32,17 @@ build-otel:
 test-otel:
     cargo test --features otel-testing
 
-# Both configurations. This is what the pre-push hook runs.
-check-all: check check-otel
+# The otel feature with the TLS backend left out, which is what a build that cannot
+# have a C dependency gets. `aws-lc-rs` compiles native code, so this configuration is
+# the one that has to keep working without cmake or a C compiler.
+check-otel-no-tls:
+    cargo clippy --all-targets --no-default-features --features otel -- -D warnings
+    cargo build --no-default-features --features otel
+    cargo test --no-default-features --features otel
+    ./scripts/no-c-deps.sh
+
+# Every configuration the crate ships in. This is what the pre-push hook runs.
+check-all: check check-otel check-otel-no-tls
 
 # A default-feature build must pull in no opentelemetry crate.
 no-otel-default:
