@@ -8,7 +8,7 @@ default:
 # git pre-push hook so it runs automatically before every push.
 
 # The gate for the default feature set.
-check: fmt-check lint build test no-otel-default
+check: fmt-check lint build test no-otel-default consumer-resolves
 fmt-check:
     cargo fmt --check
 fmt:
@@ -47,6 +47,12 @@ check-all: check check-otel check-otel-no-tls
 # A default-feature build must pull in no opentelemetry crate.
 no-otel-default:
     ./scripts/no-otel-default.sh
+
+# A consumer must be able to resolve our features against current dependency
+# versions. This cannot be checked from inside the repo: our own Cargo.lock does not
+# constrain a dependent, so it hides exactly this class of fault.
+consumer-resolves:
+    ./scripts/consumer-resolves.sh
 
 premerge:
     git fetch origin

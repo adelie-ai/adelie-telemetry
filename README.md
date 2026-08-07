@@ -324,8 +324,28 @@ They do not share a TLS stack, and the difference decides what a container image
 
 | transport | trust anchors | consequence |
 |---|---|---|
-| `grpc` | compiled-in webpki roots | independent of the image; works in a `FROM scratch` container |
-| `http/protobuf` | the OS trust store, through `rustls-platform-verifier` | the image needs `ca-certificates`, or every HTTPS export fails |
+| `grpc` | webpki roots, compiled into the binary | independent of the image; works in a `FROM scratch` container |
+| `http/protobuf` | the operating system trust store, through `rustls-platform-verifier` | the image needs `ca-certificates`, or every HTTPS export fails |
+
+The HTTP side reads the OS store and only the OS store. An earlier version of this crate
+also enabled a compiled-in root set for it, which `rustls-platform-verifier` supersedes and
+which capped every consumer's `reqwest` version; dropping it changed no behaviour.
+
+**Compiled-in roots go stale, and that is not a theoretical problem.** `webpki-roots` is a
+snapshot of a root list taken when that crate version was published. A certificate authority
+root added after the snapshot is not trusted, however current the certificate is, and the
+only fix is a new `webpki-roots` release plus a rebuild. The OS store has no such problem
+because the distribution updates it.
+
+This has already been observed against a real collector: an endpoint holding a valid Let's
+Encrypt certificate that chains to `ISRG Root YR` is accepted over `http/protobuf` and
+rejected over `grpc` with `invalid peer certificate: UnknownIssuer`, because
+`webpki-roots 1.0.9` carries `ISRG Root X1` and not `ISRG Root YR`.
+
+So for an HTTPS collector, prefer `http/protobuf`. Use `grpc` over TLS only where the
+collector's issuing root is known to be in the pinned `webpki-roots`, or switch the gRPC
+side to system roots with the `tls-roots` feature, which trades the `FROM scratch` property
+for the OS store's freshness.
 
 Two things follow, and neither is obvious:
 

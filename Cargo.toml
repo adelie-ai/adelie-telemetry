@@ -42,15 +42,23 @@ otel = [
 # gRPC over TLS fails to build without `tls-aws-lc` beside it. The provider costs
 # nothing here: reqwest already puts aws-lc-rs, rustls and tokio-rustls in the tree.
 #
-# The two transports end up trusting different stores, which is documented in the
-# README because it changes what a container image needs:
+# The two transports trust different stores, which is documented in the README
+# because it changes what a container image needs:
 #   gRPC  - compiled-in webpki roots, independent of the image.
-#   HTTP  - the OS trust store, via rustls-platform-verifier, so the image needs
-#           `ca-certificates` or every HTTPS export fails.
+#   HTTP  - the operating system trust store, through rustls-platform-verifier, so
+#           the image needs `ca-certificates` or every HTTPS export fails.
+#
+# The HTTP side uses `reqwest-rustls` and NOT `reqwest-rustls-webpki-roots`. The
+# latter enables `reqwest/webpki-roots`, a feature reqwest no longer has, and a
+# feature requirement travels to every consumer while a lockfile does not. The
+# effect on a consumer is either a silent pin to the last reqwest that still had
+# it, or an unresolvable graph the moment anything else needs a newer one. It also
+# added a root source that rustls-platform-verifier supersedes, so nothing is lost
+# by dropping it.
 otel-tls = [
     "opentelemetry-otlp?/tls-aws-lc",
     "opentelemetry-otlp?/tls-webpki-roots",
-    "opentelemetry-otlp?/reqwest-rustls-webpki-roots",
+    "opentelemetry-otlp?/reqwest-rustls",
 ]
 
 # Internal. Adds the SDK's in-memory exporter so a test can read back what the OTLP
