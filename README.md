@@ -357,9 +357,18 @@ What each configuration costs, counted with `cargo tree --edges normal`:
 | `--features otel` | 134 | `aws-lc-rs` |
 | `--no-default-features --features otel` | 119 | none |
 
-A release build pays for it in size and time as well: the `otlp_probe` example goes from
-1.13 MiB to 8.34 MiB, and a release build from 11s to 58s on a 36-thread machine. A CI
-builder with 2 to 4 cores will be several times slower again.
+A release build pays in size and time too. The `otlp_probe` example, built with
+`--release` from clean on a 36-thread machine:
+
+| configuration | binary | build |
+|---|---|---|
+| default features | 1.3 MiB | 12s |
+| `--no-default-features --features otel` | 4.7 MiB | 34s |
+| `--features otel` | 8.5 MiB | 51s |
+
+Most of that is OTLP itself, not TLS: turning export on costs 1.3 -> 4.7 MiB, and TLS adds
+4.7 -> 8.5 MiB on top. A CI builder with 2 to 4 cores will be several times slower than
+these times.
 
 A default build is unaffected either way: with `otel` off there is no OTLP crate for the
 TLS feature to apply to, so it does nothing. A desktop install from `cargo install` needs
