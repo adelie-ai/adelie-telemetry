@@ -8,6 +8,8 @@
 //!
 //! - `PROBE_SHUTDOWN_BUDGET_MS` calls `Config::with_shutdown_budget`, which is the
 //!   in-code override that must outrank the variable.
+//! - `PROBE_SUMMARY_INTERVAL_MS` calls `Config::with_metrics_dump_interval`, the other
+//!   in-code override that must outrank its variable.
 //! - `PROBE_RUNTIME=tokio` runs the same work inside a Tokio runtime.
 //!
 //! Needs the `otel` feature to export anything. Without it the program still runs, still
@@ -33,6 +35,12 @@ fn probe() {
         && let Ok(millis) = millis.parse::<u64>()
     {
         config = config.with_shutdown_budget(Duration::from_millis(millis));
+    }
+
+    if let Ok(millis) = std::env::var("PROBE_SUMMARY_INTERVAL_MS")
+        && let Ok(millis) = millis.parse::<u64>()
+    {
+        config = config.with_metrics_dump_interval(Duration::from_millis(millis));
     }
 
     let guard = adelie_telemetry::init(config).expect("init must return");

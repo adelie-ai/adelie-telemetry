@@ -67,6 +67,8 @@ mod otel;
 mod safe;
 pub mod trace_context;
 
+use std::time::Duration;
+
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -77,6 +79,31 @@ pub use trace_context::{
     SpanId, TraceContextError, TraceId, TraceOrigin, TraceParent, extract_traceparent,
     inject_traceparent, resolve_trace, resolve_trace_or_mint, trace_id_from_uuid,
 };
+
+/// How often the metrics summary is written, and what decided that.
+///
+/// Anything that chose an interval wins. When nothing did, the OTLP metrics pipeline
+/// decides: with it running, those series are already exported as metrics, and a summary
+/// would be a second copy of the same numbers in the log signal from every binary in the
+/// fleet. With nothing exporting them, the summary is the only place a number appears.
+fn metrics_summary_interval(config: &Config, metrics_exporting: bool) -> (Duration, &'static str) {
+    match (config.metrics_dump_interval(), metrics_exporting) {
+        (Some(interval), _) => (
+            interval,
+            config
+                .metrics_dump_interval_source()
+                .unwrap_or("the binary or its environment"),
+        ),
+        (None, true) => (
+            Duration::ZERO,
+            "the OTLP metrics pipeline exports the same series",
+        ),
+        (None, false) => (
+            metrics::DEFAULT_DUMP_INTERVAL,
+            "no metrics exporter is configured",
+        ),
+    }
+}
 
 /// Why telemetry could not be installed.
 #[derive(Debug, thiserror::Error)]
@@ -123,24 +150,36 @@ pub fn init(config: Config) -> Result<Guard, Error> {
         return Ok(Guard::inert());
     }
 
-    metrics::global().reconfigure(
-        metrics::Settings {
-            dump_interval: config.metrics_dump_interval(),
-            cardinality_cap: config.cardinality_cap(),
-        },
-        config.clock(),
-    );
-
     // The OTLP side is built before the subscriber, because its layers have to go in
     // beside the console layer and layers cannot be added afterwards. A failure is
     // carried, not returned: the console layer and the metrics summary must survive a
     // collector that could not be reached, and they are what an operator falls back on
     // when it cannot. The error is reported once the console exists to report it on.
+    //
+    // It is also built before the registry is configured, because whether the metrics
+    // pipeline exists is what decides the summary interval.
     #[cfg(feature = "otel")]
     let (pipelines, pipeline_error) = match otel::Pipelines::build(&config) {
         Ok(pipelines) => (Some(pipelines), None),
         Err(error) => (None, Some(error)),
     };
+
+    #[cfg(feature = "otel")]
+    let metrics_exporting = pipelines
+        .as_ref()
+        .is_some_and(otel::Pipelines::metrics_active);
+    #[cfg(not(feature = "otel"))]
+    let metrics_exporting = false;
+
+    let (dump_interval, dump_reason) = metrics_summary_interval(&config, metrics_exporting);
+
+    metrics::global().reconfigure(
+        metrics::Settings {
+            dump_interval,
+            cardinality_cap: config.cardinality_cap(),
+        },
+        config.clock(),
+    );
 
     let subscriber = tracing_subscriber::registry()
         .with(console::env_filter(&config))
@@ -185,7 +224,15 @@ pub fn init(config: Config) -> Result<Guard, Error> {
         pipelines.report().say();
     }
 
-    let dump = guard::DumpThread::spawn(config.metrics_dump_interval());
+    // Said whether the summary is on or off. An operator who expected one and does not
+    // see it can read which rule took it away instead of guessing.
+    tracing::info!(
+        interval_ms = u64::try_from(dump_interval.as_millis()).unwrap_or(u64::MAX),
+        reason = dump_reason,
+        "the metrics summary interval"
+    );
+
+    let dump = guard::DumpThread::spawn(dump_interval);
 
     Ok(Guard::new(
         dump,
