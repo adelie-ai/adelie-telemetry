@@ -77,8 +77,8 @@ impl Config {
     /// the fleet picks a new one up without a code change.
     pub fn new(service_name: impl Into<String>) -> Self {
         let lookup = |name: &str| std::env::var(name).ok();
-        let (shutdown_budget, budget_fault) = resolve_shutdown_budget(&lookup);
-        let (interval, interval_fault) = milliseconds_from(METRICS_SUMMARY_INTERVAL_VAR, &lookup);
+        let (shutdown_budget, budget_fault) = resolve_shutdown_budget(lookup);
+        let (interval, interval_fault) = milliseconds_from(METRICS_SUMMARY_INTERVAL_VAR, lookup);
 
         Self {
             service_name: service_name.into(),
