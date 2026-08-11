@@ -49,7 +49,9 @@ const INHERITED: &[&str] = &[
     "OTEL_EXPORTER_OTLP_COMPRESSION",
     "OTEL_EXPORTER_OTLP_TIMEOUT",
     "ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS",
+    "ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS",
     "PROBE_SHUTDOWN_BUDGET_MS",
+    "PROBE_SUMMARY_INTERVAL_MS",
     "PROBE_RUNTIME",
 ];
 
@@ -385,8 +387,8 @@ fn otel_sdk_disabled_keeps_console_logging_and_the_metrics_summary() {
         run.stderr
     );
     assert!(
-        run.stderr.contains("metrics summary"),
-        "stderr was: {}",
+        run.stderr.contains("metrics summary window_seconds"),
+        "the summary itself must be written, not merely announced. stderr was: {}",
         run.stderr
     );
     assert!(
@@ -604,5 +606,169 @@ fn a_zero_shutdown_budget_does_not_wait_for_the_flush() {
         "a budget of zero is what the operator asked for, so it is not a warning. \
          stderr was: {}",
         run.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// How often the in-process metrics summary is written
+// ---------------------------------------------------------------------------------
+
+/// Whether the summary itself was written.
+///
+/// Matched on a field only the summary carries. A startup line that names the interval
+/// says the summary is on; it is not the summary.
+fn wrote_a_summary(run: &Run) -> bool {
+    run.stderr.contains("metrics summary window_seconds")
+}
+
+/// With the OTLP metrics pipeline running, the summary is off.
+///
+/// Those series are already exported as metrics. The log dump would be a second copy of
+/// the same numbers in a different signal, from every binary in the fleet, every ten
+/// minutes.
+#[test]
+fn the_summary_is_off_when_the_otlp_metrics_pipeline_is_active() {
+    let run = run_probe(&[]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert!(run.metrics, "the control: metrics must be exporting");
+    assert!(
+        !wrote_a_summary(&run),
+        "the same numbers must not be paid for twice. stderr was: {}",
+        run.stderr
+    );
+}
+
+/// With no metrics exporter, the summary still writes. The no-backend case is unchanged.
+#[test]
+fn the_summary_writes_when_no_metrics_exporter_is_active() {
+    let run = run_probe(&[("OTEL_METRICS_EXPORTER", "none")]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert!(!run.metrics, "the control: metrics must not be exporting");
+    assert!(
+        wrote_a_summary(&run),
+        "with nothing exporting the series, the summary is the only place a number \
+         appears. stderr was: {}",
+        run.stderr
+    );
+}
+
+/// Switching the whole SDK off turns the summary back on for the same reason.
+#[test]
+fn the_summary_writes_when_the_sdk_is_disabled() {
+    let run = run_probe(&[("OTEL_SDK_DISABLED", "true")]);
+
+    assert!(
+        wrote_a_summary(&run),
+        "stderr was: {}",
+        run.stderr
+    );
+}
+
+/// The interval comes from the environment, so it needs no rebuild.
+#[test]
+fn the_environment_sets_the_summary_interval() {
+    let run = run_probe(&[("ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS", "30000")]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert_eq!(
+        run.field("interval_ms").as_deref(),
+        Some("30000"),
+        "stderr was: {}",
+        run.stderr
+    );
+    assert!(
+        wrote_a_summary(&run),
+        "an interval asked for by name must beat the pipeline default. stderr was: {}",
+        run.stderr
+    );
+}
+
+/// Zero turns the summary off whatever the pipeline state is.
+///
+/// Set together with `OTEL_METRICS_EXPORTER=none`, which would otherwise turn the summary
+/// on, so the test fails if the variable is read only as a fallback.
+#[test]
+fn zero_turns_the_summary_off_whatever_the_pipeline_state() {
+    let run = run_probe(&[
+        ("OTEL_METRICS_EXPORTER", "none"),
+        ("ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS", "0"),
+    ]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert!(
+        !wrote_a_summary(&run),
+        "stderr was: {}",
+        run.stderr
+    );
+}
+
+/// The in-code setter outranks the variable.
+#[test]
+fn with_metrics_dump_interval_beats_the_environment() {
+    let run = run_probe(&[
+        ("ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS", "30000"),
+        ("PROBE_SUMMARY_INTERVAL_MS", "45000"),
+    ]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert_eq!(
+        run.field("interval_ms").as_deref(),
+        Some("45000"),
+        "stderr was: {}",
+        run.stderr
+    );
+}
+
+/// A value the crate cannot parse is named, and neither enables nor disables the summary
+/// by accident: the pipeline decides, exactly as it would with the variable unset.
+#[test]
+fn an_unparseable_summary_interval_is_named_and_decides_nothing() {
+    let run = run_probe(&[("ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS", "10m")]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS"),
+        "the refusal must name the variable. stderr was: {}",
+        run.stderr
+    );
+    assert!(
+        !wrote_a_summary(&run),
+        "with metrics exporting, an unusable value must leave the summary off, which is \
+         what it would have been. stderr was: {}",
+        run.stderr
+    );
+}
+
+/// Startup states the resolved interval and why, so an operator who expected a summary
+/// and does not see one can tell which rule took it away.
+#[test]
+fn startup_states_the_resolved_interval_and_the_reason() {
+    let exporting = run_probe(&[]);
+    assert_eq!(
+        exporting.field("interval_ms").as_deref(),
+        Some("0"),
+        "stderr was: {}",
+        exporting.stderr
+    );
+    assert!(
+        exporting.stderr.contains("the OTLP metrics pipeline"),
+        "the reason must name the pipeline that took it away. stderr was: {}",
+        exporting.stderr
+    );
+
+    let not_exporting = run_probe(&[("OTEL_METRICS_EXPORTER", "none")]);
+    assert_eq!(
+        not_exporting.field("interval_ms").as_deref(),
+        Some("600000"),
+        "stderr was: {}",
+        not_exporting.stderr
+    );
+    assert!(
+        not_exporting.stderr.contains("no metrics exporter"),
+        "stderr was: {}",
+        not_exporting.stderr
     );
 }

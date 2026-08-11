@@ -109,7 +109,7 @@ fn a_failed_otlp_pipeline_leaves_the_metrics_summary_running() {
     let (stderr, _) = run_probe(FAILING_PIPELINE);
 
     assert!(
-        stderr.contains("metrics summary"),
+        stderr.contains("metrics summary window_seconds"),
         "the in-process summary must still be written. stderr was: {stderr}"
     );
     assert!(stderr.contains("probe.requests"));
