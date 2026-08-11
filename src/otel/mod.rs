@@ -301,6 +301,15 @@ impl Pipelines {
         &self.report
     }
 
+    /// Whether the OTLP metrics pipeline was built.
+    ///
+    /// What decides the in-process metrics summary: while this is true the same series
+    /// are already exported as metrics, so writing them to the log as well would be a
+    /// second copy of one set of numbers.
+    pub(crate) fn metrics_active(&self) -> bool {
+        self.metrics.is_some()
+    }
+
     /// The subscriber layers that feed these pipelines, or `None` when there are none.
     ///
     /// A signal that was switched off contributes no layer, so nothing is recorded for it

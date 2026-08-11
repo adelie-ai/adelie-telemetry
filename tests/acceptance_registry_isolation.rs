@@ -96,10 +96,13 @@ fn a_scope_covers_counters_and_histograms() {
 /// Without this the scope could be a second copy rather than a replacement, and the
 /// process registry would still accumulate every test's measurements - which is the leak,
 /// only harder to see.
+///
+/// The assertion names one instrument rather than counting the process registry's series.
+/// A count is the flake this whole file exists to remove: `recording_returns_to_the_...`
+/// below records into the process registry on purpose, at the same time, so any total
+/// taken here is another test's business as much as this one's.
 #[test]
 fn a_scope_keeps_its_measurements_out_of_the_process_registry() {
-    let before = metrics::global().series_count();
-
     {
         let _scope = TestScope::new();
         metrics::increment("scope.only.counter", &[]);
@@ -114,11 +117,6 @@ fn a_scope_keeps_its_measurements_out_of_the_process_registry() {
     assert!(
         !names.contains(&"scope.only.counter"),
         "a scoped measurement must not reach the process registry, found {names:?}"
-    );
-    assert_eq!(
-        metrics::global().series_count(),
-        before,
-        "the process registry must be untouched"
     );
 }
 
