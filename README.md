@@ -361,9 +361,10 @@ still prints locally.
 
 ### Configuration
 
-Everything comes from the standard `OTEL_*` environment variables. There are no CLI flags
-and no Adelie-specific variables. This crate passes nothing to the exporter builders, so
-every variable below reaches them.
+Everything comes from the standard `OTEL_*` environment variables. There are no CLI flags.
+This crate passes no endpoint, protocol, header or timeout to the exporter builders, so
+every variable below reaches them. One variable is this crate's own, and it is named as
+such below the table.
 
 | Variable | Effect |
 |---|---|
@@ -385,7 +386,22 @@ every variable below reaches them.
 | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Timeout for log records. Overrides the generic one. |
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd`, for all three. Per-signal forms exist too. |
 | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value`. |
+| `OTEL_SERVICE_NAME` | The service name. **Beats the name the binary passed to `Config::new`.** |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value`. A `service.name` entry in it does **not** beat `Config::new`. |
+| `OTEL_SDK_DISABLED` | `true` builds no pipeline at all. Any other value leaves export on. |
+| `OTEL_TRACES_EXPORTER` | `none` switches traces off. `otlp` is the default and the only other value. |
+| `OTEL_METRICS_EXPORTER` | `none` switches metrics off. `otlp` is the default and the only other value. |
+| `OTEL_LOGS_EXPORTER` | `none` switches log records off. `otlp` is the default and the only other value. |
+
+One more variable is **not** an `OTEL_*` one, and is deliberately outside that namespace:
+
+| Variable | Effect |
+|---|---|
+| `ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS` | How long the guard may spend flushing, in whole milliseconds. `0` means do not wait at all. |
+
+It is not exporter configuration. `OTEL_EXPORTER_OTLP_TIMEOUT` is read by the SDK and
+means the per-export timeout, which is a different thing; this is how long the process is
+willing to wait before it stops.
 
 A per-signal variable beats the generic one. The generic endpoint has the signal's path
 appended to it (`/v1/traces` and so on); a per-signal endpoint is used exactly as written,
@@ -396,6 +412,74 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4318 \
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
   ./adele-daemon
 ```
+
+### What startup says
+
+One line at INFO, once the console exists to write it on:
+
+```text
+INFO telemetry export is on service_name=adele-daemon service_name_from=OTEL_SERVICE_NAME
+resource_attributes=k8s.namespace.name,k8s.node.name,k8s.pod.name,service.name,...
+traces=on metrics=on logs=off shutdown_budget_ms=5000
+```
+
+It answers the questions an operator has after setting a variable: which name reached the
+backend and which source supplied it, whether the pairs in `OTEL_RESOURCE_ATTRIBUTES`
+arrived, which signals export, and how long a stop may take. The service name and the key
+list are read back off the resource the SDK built, not from the decision that went into
+it.
+
+A variable that was set and could not be honoured is named at WARN, and export continues:
+
+```text
+WARN a telemetry variable could not be honoured detail=OTEL_TRACES_EXPORTER=zipkin names
+an exporter this build does not have. Only `otlp` and `none` are implemented, so this
+signal keeps exporting over OTLP
+```
+
+### Which value names the service
+
+Highest first:
+
+1. `OTEL_SERVICE_NAME`.
+2. The name the binary passed to `Config::new`.
+3. `service.name` inside `OTEL_RESOURCE_ATTRIBUTES`, which never wins.
+
+The two variables are treated differently on purpose, and the difference is propagation.
+`OTEL_SERVICE_NAME` is per process: the daemon builds the environment of every MCP server
+it spawns from an allowlist, and that variable is not on it, so honouring it renames one
+process. `OTEL_RESOURCE_ATTRIBUTES` **is** passed down to every server, so that a server
+span carries the pod, the namespace and the node. If a `service.name` entry in it won,
+every server and the daemon would report as one service and no trace would be readable.
+The specification agrees: user-supplied resource information outranks that variable.
+
+Every other pair in `OTEL_RESOURCE_ATTRIBUTES` reaches the resource untouched. To tell two
+deployments of one binary apart, either name is fine; to add deployment context to both,
+use `OTEL_RESOURCE_ATTRIBUTES`.
+
+### Turning export off
+
+Three ways, none of which needs a rebuild:
+
+```sh
+OTEL_SDK_DISABLED=true ./adele-daemon          # no pipeline at all
+OTEL_LOGS_EXPORTER=none ./adele-daemon         # one signal off, the other two on
+```
+
+Only the exact value `true` disables the SDK, which the specification requires; `1`, `yes`
+and `on` leave export running and are reported at WARN. An exporter name this build does
+not have - `zipkin`, `prometheus`, `console` - is reported and ignored, and the signal
+keeps exporting over OTLP. Reading an unrecognised name as `none` would silently stop a
+signal an operator asked for.
+
+The console layer and the metrics summary are unaffected by all of this. They are what an
+operator falls back on when there is no backend, so nothing about export can remove them.
+
+**With no endpoint variable set at all**, the OTLP default `http://localhost:4318` applies.
+That is the specification's default and this crate keeps it, because a collector on the
+default port is the ordinary development case. Startup names the default and the three
+ways above, so a process exporting into a socket nobody is listening on says so rather
+than retrying in silence.
 
 ### Choosing a transport
 
@@ -552,8 +636,18 @@ that exits without a flush loses whatever was still in the buffer, which is usua
 worth having, because a crash is what was being investigated.
 
 Shutdown is bounded. Each provider can block for about five seconds against an unreachable
-collector, and there are six calls, so an unbounded drop can run for thirty seconds.
-`Config::with_shutdown_budget` caps the total, and the default is five seconds.
+collector, and there are six calls, so an unbounded drop can run for thirty seconds. The
+budget caps the total, and the default is five seconds.
+
+`ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS` sets it at run time, so a rollout can follow a
+shorter `terminationGracePeriodSeconds` without rebuilding every binary in the fleet.
+`Config::with_shutdown_budget` outranks the variable, for a binary that must have a
+particular budget. A value that is not a whole number of milliseconds, or is negative, is
+named at startup and ignored.
+
+`0` means do not wait at all: nothing is flushed and the process stops. Whatever the
+exporters had buffered is dropped, which is what a budget of zero asks for, so it is
+stated once at INFO and is not a warning.
 
 **Kubernetes:** set `terminationGracePeriodSeconds` to at least 30 in any deployment that
 runs with `otel` on. The default is 30, and the pod needs room to flush telemetry *and*

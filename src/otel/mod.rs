@@ -33,8 +33,29 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::metrics::DURATION_BUCKETS_MS;
+use crate::safe::Safe;
 
 mod preflight;
+mod resource;
+mod switches;
+
+use switches::Switches;
+
+/// The endpoint variables, checked together to tell whether any endpoint was set at all.
+const ENDPOINT_VARS: &[&str] = &[
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+];
+
+/// Where the OTLP exporters send when no endpoint variable names one.
+///
+/// The specification's default, and this crate keeps it. Refusing to start would break
+/// the ordinary case of a collector on the default port, and exporting nothing would be a
+/// second surprise in place of the first. Naming it at startup costs one line and removes
+/// the surprise, which is what [`Report::say`] does.
+const DEFAULT_ENDPOINT: &str = "http://localhost:4318";
 
 /// The OTLP variables that are set, for a failure report. Header values are withheld.
 pub(crate) fn configuration_summary() -> String {
@@ -49,74 +70,251 @@ fn duration_bucket_boundaries() -> Vec<f64> {
     DURATION_BUCKETS_MS.to_vec()
 }
 
-/// The three providers, held so they can be flushed and shut down together.
+/// What `init` says about the export it has just set up.
+///
+/// Held rather than written where each part is decided, because none of it can be
+/// written until the subscriber exists, and the subscriber cannot be built until the
+/// layers are. [`say`](Self::say) is called once the console is there to say it on.
+#[derive(Clone, Debug)]
+pub(crate) struct Report {
+    /// The `service.name` the built resource really carries.
+    service_name: String,
+    /// Which of the two possible sources supplied it.
+    service_name_from: &'static str,
+    /// Every attribute key the resource carries, so an operator can see whether the
+    /// pairs they put in `OTEL_RESOURCE_ATTRIBUTES` arrived.
+    resource_attributes: String,
+    /// Whether the trace signal exports.
+    traces: bool,
+    /// Whether the metric signal exports.
+    metrics: bool,
+    /// Whether the log-record signal exports.
+    logs: bool,
+    /// How long the guard may spend flushing.
+    shutdown_budget: Duration,
+    /// No endpoint variable was set, so the OTLP default applies.
+    default_endpoint: bool,
+    /// `OTEL_SDK_DISABLED` switched every signal off.
+    disabled: bool,
+    /// What the environment asked for and could not have.
+    complaints: Vec<String>,
+}
+
+impl Report {
+    /// Write what this process will export, and why.
+    ///
+    /// Every line here exists because a setting that changes nothing and says nothing
+    /// costs an operator the time it takes to work out that it was never wired.
+    pub(crate) fn say(&self) {
+        for complaint in &self.complaints {
+            // Sanitised, because the text quotes a value that came from a deployment
+            // overlay. A YAML block scalar puts a line break in one by accident long
+            // before anybody does it on purpose, and one forged line in `kubectl logs`
+            // reads exactly like a real one.
+            tracing::warn!(
+                detail = %Safe::message(complaint),
+                "a telemetry variable could not be honoured"
+            );
+        }
+
+        if self.disabled {
+            tracing::info!(
+                "telemetry export is off by request: {} is true. Console logging and the \
+                 metrics summary are unaffected",
+                switches::SDK_DISABLED_VAR
+            );
+            return;
+        }
+
+        tracing::info!(
+            service_name = %Safe::name(&self.service_name),
+            service_name_from = self.service_name_from,
+            resource_attributes = %Safe::message(&self.resource_attributes),
+            traces = on_off(self.traces),
+            metrics = on_off(self.metrics),
+            logs = on_off(self.logs),
+            shutdown_budget_ms =
+                u64::try_from(self.shutdown_budget.as_millis()).unwrap_or(u64::MAX),
+            "telemetry export is on"
+        );
+
+        if self.default_endpoint {
+            tracing::info!(
+                "no endpoint variable is set, so the OTLP default {DEFAULT_ENDPOINT} \
+                 applies. Set {}=true, or {}, {} or {} to none, to export nothing",
+                switches::SDK_DISABLED_VAR,
+                switches::TRACES_EXPORTER_VAR,
+                switches::METRICS_EXPORTER_VAR,
+                switches::LOGS_EXPORTER_VAR
+            );
+        }
+    }
+}
+
+/// A signal's state, for a log field.
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
+}
+
+/// The providers that were built, held so they can be flushed and shut down together.
+///
+/// Each is optional because the environment may switch its signal off, and a pipeline
+/// that exists always exports somewhere. All three are `None` when `OTEL_SDK_DISABLED`
+/// asked for that.
 #[derive(Debug)]
 pub(crate) struct Pipelines {
-    traces: SdkTracerProvider,
-    metrics: SdkMeterProvider,
-    logs: SdkLoggerProvider,
+    traces: Option<SdkTracerProvider>,
+    metrics: Option<SdkMeterProvider>,
+    logs: Option<SdkLoggerProvider>,
+    report: Report,
 }
 
 impl Pipelines {
-    /// Build the three pipelines, register them globally, and return them.
+    /// Build the pipelines the environment asks for, register them globally, and return
+    /// them.
     pub(crate) fn build(config: &Config) -> Result<Self, crate::Error> {
-        let resource = Resource::builder()
-            .with_service_name(config.service_name().to_owned())
-            .build();
+        Self::build_from(config, |name| std::env::var(name).ok())
+    }
 
-        preflight::check(
-            "traces",
-            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-        )?;
-        let span_exporter = roots::traces_exporter("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-            .map_err(|error| pipeline_error("traces", &error))?;
-        let traces = SdkTracerProvider::builder()
-            .with_resource(resource.clone())
-            .with_batch_exporter(span_exporter)
-            .build();
+    /// The same, over a given source of variable values.
+    ///
+    /// The source is a parameter for the reason the registry takes a clock: a test cannot
+    /// set up process-global state without disturbing another test running beside it, and
+    /// the environment is the worst case of that.
+    fn build_from(
+        config: &Config,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, crate::Error> {
+        let switches = Switches::resolve(&lookup);
+        let (service_name, source) = resource::resolve_service_name(config.service_name(), &lookup);
 
-        preflight::check(
-            "metrics",
-            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        )?;
-        let metric_exporter = roots::metrics_exporter("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
-            .map_err(|error| pipeline_error("metrics", &error))?;
-        let metrics = SdkMeterProvider::builder()
-            .with_resource(resource.clone())
-            .with_periodic_exporter(metric_exporter)
-            .with_view(duration_view)
-            .build();
+        let mut report = Report {
+            service_name,
+            service_name_from: source.as_str(),
+            resource_attributes: String::new(),
+            traces: switches.traces,
+            metrics: switches.metrics,
+            logs: switches.logs,
+            shutdown_budget: config.shutdown_budget(),
+            default_endpoint: ENDPOINT_VARS
+                .iter()
+                .all(|name| lookup(name).is_none_or(|value| value.trim().is_empty())),
+            disabled: switches.sdk_disabled,
+            complaints: switches.complaints,
+        };
 
-        preflight::check(
-            "logs",
-            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-        )?;
-        let log_exporter = roots::logs_exporter("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
-            .map_err(|error| pipeline_error("logs", &error))?;
-        let logs = SdkLoggerProvider::builder()
-            .with_resource(resource)
-            .with_batch_exporter(log_exporter)
-            .build();
+        if switches.sdk_disabled {
+            return Ok(Self {
+                traces: None,
+                metrics: None,
+                logs: None,
+                report,
+            });
+        }
 
-        opentelemetry::global::set_tracer_provider(traces.clone());
-        opentelemetry::global::set_meter_provider(metrics.clone());
+        let resource = resource::resource(Resource::builder(), report.service_name.clone());
 
-        // Any instrument built before that call is bound to the no-op meter provider and
-        // would record nothing for the rest of the process. A call site is allowed to
-        // record before the binary calls `init`, so drop them and let them be rebuilt.
-        crate::metrics::otel_bridge::reset_instruments();
+        // Read back off the built resource rather than taken from the decision that went
+        // into it, so what startup reports is what the SDK produced. If the SDK's merge
+        // direction ever reversed, this line would say so instead of hiding it.
+        report.service_name = resource::service_name_of(&resource);
+        report.resource_attributes = resource::attribute_keys(&resource);
+
+        let traces = if switches.traces {
+            preflight::check(
+                "traces",
+                "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            )?;
+            let span_exporter = roots::traces_exporter("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+                .map_err(|error| pipeline_error("traces", &error))?;
+            Some(
+                SdkTracerProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_batch_exporter(span_exporter)
+                    .build(),
+            )
+        } else {
+            None
+        };
+
+        let metrics = if switches.metrics {
+            preflight::check(
+                "metrics",
+                "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            )?;
+            let metric_exporter = roots::metrics_exporter("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+                .map_err(|error| pipeline_error("metrics", &error))?;
+            Some(
+                SdkMeterProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_periodic_exporter(metric_exporter)
+                    .with_view(duration_view)
+                    .build(),
+            )
+        } else {
+            None
+        };
+
+        let logs = if switches.logs {
+            preflight::check(
+                "logs",
+                "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            )?;
+            let log_exporter = roots::logs_exporter("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+                .map_err(|error| pipeline_error("logs", &error))?;
+            Some(
+                SdkLoggerProvider::builder()
+                    .with_resource(resource)
+                    .with_batch_exporter(log_exporter)
+                    .build(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(traces) = traces.as_ref() {
+            opentelemetry::global::set_tracer_provider(traces.clone());
+        }
+        if let Some(metrics) = metrics.as_ref() {
+            opentelemetry::global::set_meter_provider(metrics.clone());
+
+            // Any instrument built before that call is bound to the no-op meter provider
+            // and would record nothing for the rest of the process. A call site is
+            // allowed to record before the binary calls `init`, so drop them and let them
+            // be rebuilt.
+            crate::metrics::otel_bridge::reset_instruments();
+        }
 
         Ok(Self {
             traces,
             metrics,
             logs,
+            report,
         })
     }
 
-    /// The subscriber layers that feed these pipelines.
+    /// What startup should say about this process's export.
+    pub(crate) fn report(&self) -> &Report {
+        &self.report
+    }
+
+    /// The subscriber layers that feed these pipelines, or `None` when there are none.
+    ///
+    /// A signal that was switched off contributes no layer, so nothing is recorded for it
+    /// and nothing is buffered waiting for a pipeline that does not exist.
+    ///
+    /// # Why `None` and not an empty `Vec`
+    ///
+    /// `Layer` is implemented for `Vec<L>`, and an empty one is not a layer that does
+    /// nothing. Its `max_level_hint` is documented to "default to `OFF` if there are no
+    /// inner layers", and its `register_callsite` returns `Interest::never()`. Both feed
+    /// the subscriber's global hint, so an empty `Vec` silences **every** layer beside
+    /// it, including the console. With `OTEL_SDK_DISABLED=true` that made the whole
+    /// process mute. `Option::None` contributes nothing at all, which is what is wanted
+    /// here.
     ///
     /// # Which pipeline owns an event
     ///
@@ -135,24 +333,37 @@ impl Pipelines {
     /// failed when it sees an error event, and that status is what makes a failed turn
     /// visible in a trace view rather than looking green. Error events are therefore
     /// allowed through to both, and are the only events that appear twice.
-    pub(crate) fn layers<S>(&self) -> Vec<Box<dyn Layer<S> + Send + Sync>>
+    pub(crate) fn layers<S>(&self) -> Option<Vec<Box<dyn Layer<S> + Send + Sync>>>
     where
         S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
     {
-        let trace_layer = tracing_opentelemetry::layer::<S>()
-            .with_tracer(self.traces.tracer(env!("CARGO_PKG_NAME")))
-            .with_filter(filter_fn(|metadata: &tracing::Metadata<'_>| {
-                metadata.is_span() || *metadata.level() == Level::ERROR
-            }));
+        let mut layers: Vec<Box<dyn Layer<S> + Send + Sync>> = Vec::new();
 
-        let log_layer: OpenTelemetryTracingBridge<SdkLoggerProvider, _> =
-            OpenTelemetryTracingBridge::new(&self.logs);
+        if let Some(traces) = self.traces.as_ref() {
+            layers.push(Box::new(
+                tracing_opentelemetry::layer::<S>()
+                    .with_tracer(traces.tracer(env!("CARGO_PKG_NAME")))
+                    .with_filter(filter_fn(|metadata: &tracing::Metadata<'_>| {
+                        metadata.is_span() || *metadata.level() == Level::ERROR
+                    })),
+            ));
+        }
 
-        vec![Box::new(trace_layer), Box::new(log_layer)]
+        if let Some(logs) = self.logs.as_ref() {
+            let log_layer: OpenTelemetryTracingBridge<SdkLoggerProvider, _> =
+                OpenTelemetryTracingBridge::new(logs);
+            layers.push(Box::new(log_layer));
+        }
+
+        if layers.is_empty() {
+            None
+        } else {
+            Some(layers)
+        }
     }
 
-    /// Flush and shut down all three pipelines, in the order traces, metrics, logs,
-    /// within `budget`.
+    /// Flush and shut down every pipeline that was built, in the order traces, metrics,
+    /// logs, within `budget`.
     ///
     /// Why a budget: each provider's flush and shutdown blocks for up to five seconds
     /// against an unreachable collector, and there are six calls. Thirty seconds in `Drop`
@@ -160,10 +371,27 @@ impl Pipelines {
     /// defaults to, so the pod is killed part way through shutdown, which is the failure
     /// this telemetry exists to make visible.
     ///
+    /// A budget of zero means do not wait at all, and nothing is flushed. Whoever set it
+    /// asked for exactly that, so it is stated once and is not a warning. The alternative
+    /// was letting `Duration::ZERO` reach `shutdown_with_timeout`, where it times out at
+    /// once and warns about lost telemetry on every single stop.
+    ///
     /// The work runs on its own thread so the budget can be enforced. A thread that
     /// overruns is left running; the process is exiting, and an exporter that will not
     /// stop must not decide when.
     pub(crate) fn shutdown(&self, budget: Duration) {
+        if self.traces.is_none() && self.metrics.is_none() && self.logs.is_none() {
+            return;
+        }
+
+        if budget.is_zero() {
+            tracing::info!(
+                "the shutdown budget is zero, so the OTLP pipelines are not flushed; \
+                 whatever they had buffered is dropped"
+            );
+            return;
+        }
+
         let traces = self.traces.clone();
         let metrics = self.metrics.clone();
         let logs = self.logs.clone();
@@ -172,14 +400,7 @@ impl Pipelines {
         let spawned = std::thread::Builder::new()
             .name("adelie-telemetry-shutdown".to_owned())
             .spawn(move || {
-                // A failure here is reported and then dropped. The process is on its way
-                // out, and there is nowhere left to propagate to.
-                report("traces", "flush", traces.force_flush());
-                report("traces", "shutdown", traces.shutdown_with_timeout(budget));
-                report("metrics", "flush", metrics.force_flush());
-                report("metrics", "shutdown", metrics.shutdown_with_timeout(budget));
-                report("logs", "flush", logs.force_flush());
-                report("logs", "shutdown", logs.shutdown_with_timeout(budget));
+                flush_and_stop(traces, metrics, logs, budget);
                 let _ = done.send(());
             });
 
@@ -195,19 +416,38 @@ impl Pipelines {
             }
             Err(error) => {
                 tracing::warn!(%error, "could not start the shutdown thread; flushing inline");
-                report(
-                    "traces",
-                    "shutdown",
-                    self.traces.shutdown_with_timeout(budget),
+                flush_and_stop(
+                    self.traces.clone(),
+                    self.metrics.clone(),
+                    self.logs.clone(),
+                    budget,
                 );
-                report(
-                    "metrics",
-                    "shutdown",
-                    self.metrics.shutdown_with_timeout(budget),
-                );
-                report("logs", "shutdown", self.logs.shutdown_with_timeout(budget));
             }
         }
+    }
+}
+
+/// Flush and stop whichever providers exist, in the order traces, metrics, logs.
+///
+/// A failure here is reported and then dropped. The process is on its way out, and there
+/// is nowhere left to propagate to.
+fn flush_and_stop(
+    traces: Option<SdkTracerProvider>,
+    metrics: Option<SdkMeterProvider>,
+    logs: Option<SdkLoggerProvider>,
+    budget: Duration,
+) {
+    if let Some(traces) = traces {
+        report("traces", "flush", traces.force_flush());
+        report("traces", "shutdown", traces.shutdown_with_timeout(budget));
+    }
+    if let Some(metrics) = metrics {
+        report("metrics", "flush", metrics.force_flush());
+        report("metrics", "shutdown", metrics.shutdown_with_timeout(budget));
+    }
+    if let Some(logs) = logs {
+        report("logs", "flush", logs.force_flush());
+        report("logs", "shutdown", logs.shutdown_with_timeout(budget));
     }
 }
 
