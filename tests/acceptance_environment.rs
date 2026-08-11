@@ -146,7 +146,10 @@ fn run_probe(env: &[(&str, &str)]) -> Run {
     command
         .env("RUST_LOG", "info")
         .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-        .env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", traces.url("/v1/traces"))
+        .env(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            traces.url("/v1/traces"),
+        )
         .env(
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
             metrics.url("/v1/metrics"),
@@ -256,6 +259,41 @@ fn configured_service_name_beats_service_name_in_otel_resource_attributes() {
     );
 }
 
+/// Fixing the service name must not be done by ignoring the resource variable.
+///
+/// That is the obvious wrong answer, and it would take the pod, namespace and node
+/// attributes with it - which is the only reason `desktop-assistant` propagates the
+/// variable to every server it spawns. This is the criterion that stops that fix.
+#[test]
+fn other_otel_resource_attributes_still_reach_the_resource() {
+    let run = run_probe(&[(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "service.name=named-by-the-resource-variable,k8s.pod.name=pod-7,k8s.node.name=node-3",
+    )]);
+
+    assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
+
+    let keys = run
+        .field("resource_attributes")
+        .unwrap_or_else(|| panic!("startup must list the resource keys: {}", run.stderr));
+    assert!(
+        keys.contains("k8s.pod.name"),
+        "the pod attribute must survive, found {keys}. stderr was: {}",
+        run.stderr
+    );
+    assert!(
+        keys.contains("k8s.node.name"),
+        "the node attribute must survive, found {keys}. stderr was: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.field("service_name").as_deref(),
+        Some("signals-probe"),
+        "and the service name is still the configured one. stderr was: {}",
+        run.stderr
+    );
+}
+
 /// `OTEL_SERVICE_NAME` beats a `service.name` entry in `OTEL_RESOURCE_ATTRIBUTES`, which
 /// the specification states outright.
 #[test]
@@ -315,7 +353,11 @@ fn all_three_signals_export_when_nothing_is_switched_off() {
 
     assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
     assert!(run.traces, "traces must export. stderr was: {}", run.stderr);
-    assert!(run.metrics, "metrics must export. stderr was: {}", run.stderr);
+    assert!(
+        run.metrics,
+        "metrics must export. stderr was: {}",
+        run.stderr
+    );
     assert!(run.logs, "logs must export. stderr was: {}", run.stderr);
 }
 

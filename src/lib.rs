@@ -108,6 +108,14 @@ pub enum Error {
 /// variables. With the feature off, the metrics registry still accumulates and still
 /// writes its periodic summary.
 ///
+/// `OTEL_SDK_DISABLED=true` builds no pipeline at all, and `OTEL_TRACES_EXPORTER`,
+/// `OTEL_METRICS_EXPORTER` and `OTEL_LOGS_EXPORTER` take `none` to switch one signal off.
+/// The console layer and the metrics summary are installed either way.
+///
+/// One line at INFO says what this process will export: the service name and where it
+/// came from, which signals are on, and how long shutdown may take. A variable that was
+/// set and could not be honoured is named at WARN.
+///
 /// Calling this a second time in one process is a no-op that returns an inert guard. A
 /// library must not call it at all; the binary owns the subscriber.
 pub fn init(config: Config) -> Result<Guard, Error> {
@@ -139,7 +147,7 @@ pub fn init(config: Config) -> Result<Guard, Error> {
         .with(console::console_layer(&config, std::io::stderr));
 
     #[cfg(feature = "otel")]
-    let subscriber = subscriber.with(pipelines.as_ref().map(otel::Pipelines::layers));
+    let subscriber = subscriber.with(pipelines.as_ref().and_then(otel::Pipelines::layers));
 
     // A foreign subscriber may already be installed, in which case this process is not
     // ours to configure. Take nothing over, and hand back a guard that owns nothing.
@@ -151,6 +159,15 @@ pub fn init(config: Config) -> Result<Guard, Error> {
         return Ok(Guard::inert());
     }
 
+    // What the environment asked for and could not have. Reported here rather than where
+    // it was found, because `Config::new` runs before any subscriber exists.
+    for fault in config.faults() {
+        tracing::warn!(
+            detail = %safe::Safe::message(fault),
+            "a telemetry variable could not be honoured"
+        );
+    }
+
     #[cfg(feature = "otel")]
     if let Some(error) = pipeline_error {
         tracing::error!(
@@ -159,6 +176,13 @@ pub fn init(config: Config) -> Result<Guard, Error> {
             "telemetry export is off for this process; console logging and the metrics \
              summary are unaffected"
         );
+    }
+
+    // What this process will export, and why. A setting that changes nothing and says
+    // nothing costs an operator the time it takes to find out it was never wired.
+    #[cfg(feature = "otel")]
+    if let Some(pipelines) = pipelines.as_ref() {
+        pipelines.report().say();
     }
 
     let dump = guard::DumpThread::spawn(config.metrics_dump_interval());
