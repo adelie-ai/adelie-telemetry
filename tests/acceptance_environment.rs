@@ -659,11 +659,7 @@ fn the_summary_writes_when_no_metrics_exporter_is_active() {
 fn the_summary_writes_when_the_sdk_is_disabled() {
     let run = run_probe(&[("OTEL_SDK_DISABLED", "true")]);
 
-    assert!(
-        wrote_a_summary(&run),
-        "stderr was: {}",
-        run.stderr
-    );
+    assert!(wrote_a_summary(&run), "stderr was: {}", run.stderr);
 }
 
 /// The interval comes from the environment, so it needs no rebuild.
@@ -697,11 +693,7 @@ fn zero_turns_the_summary_off_whatever_the_pipeline_state() {
     ]);
 
     assert!(run.success, "the probe must exit cleanly: {}", run.stderr);
-    assert!(
-        !wrote_a_summary(&run),
-        "stderr was: {}",
-        run.stderr
-    );
+    assert!(!wrote_a_summary(&run), "stderr was: {}", run.stderr);
 }
 
 /// The in-code setter outranks the variable.

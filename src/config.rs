@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::{Clock, SystemClock};
-use crate::metrics::{DEFAULT_CARDINALITY_CAP, DEFAULT_DUMP_INTERVAL};
+use crate::metrics::DEFAULT_CARDINALITY_CAP;
 
 /// The filter used when neither `RUST_LOG` nor the caller says otherwise.
 pub const DEFAULT_FILTER: &str = "info";
@@ -28,6 +28,18 @@ pub const DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 /// ignored. [`Config::with_shutdown_budget`] outranks it.
 pub const SHUTDOWN_BUDGET_VAR: &str = "ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS";
 
+/// The variable that sets how often the metrics summary is written, in whole
+/// milliseconds.
+///
+/// **Not one of the `OTEL_*` variables**, for the same reason as
+/// [`SHUTDOWN_BUDGET_VAR`]: the summary is this crate's own in-process report, not an
+/// exporter.
+///
+/// `0` turns the summary off. With the variable unset, `init` decides: off when the OTLP
+/// metrics pipeline is exporting the same series, and on when nothing is.
+/// [`Config::with_metrics_dump_interval`] outranks it.
+pub const METRICS_SUMMARY_INTERVAL_VAR: &str = "ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS";
+
 /// How a binary configures its telemetry.
 ///
 /// Everything past the service name has a working default, so the common case is
@@ -38,7 +50,7 @@ pub const SHUTDOWN_BUDGET_VAR: &str = "ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS";
 pub struct Config {
     service_name: String,
     default_filter: String,
-    metrics_dump_interval: Duration,
+    metrics_dump_interval: IntervalChoice,
     cardinality_cap: usize,
     span_close_events: bool,
     shutdown_budget: Duration,
@@ -64,15 +76,21 @@ impl Config {
     /// The shutdown budget is read from [`SHUTDOWN_BUDGET_VAR`] here, so every binary in
     /// the fleet picks a new one up without a code change.
     pub fn new(service_name: impl Into<String>) -> Self {
-        let (shutdown_budget, fault) = resolve_shutdown_budget(|name| std::env::var(name).ok());
+        let lookup = |name: &str| std::env::var(name).ok();
+        let (shutdown_budget, budget_fault) = resolve_shutdown_budget(&lookup);
+        let (interval, interval_fault) = milliseconds_from(METRICS_SUMMARY_INTERVAL_VAR, &lookup);
+
         Self {
             service_name: service_name.into(),
             default_filter: DEFAULT_FILTER.to_owned(),
-            metrics_dump_interval: DEFAULT_DUMP_INTERVAL,
+            metrics_dump_interval: match interval {
+                Some(interval) => IntervalChoice::Variable(interval),
+                None => IntervalChoice::Unset,
+            },
             cardinality_cap: DEFAULT_CARDINALITY_CAP,
             span_close_events: false,
             shutdown_budget,
-            faults: fault.into_iter().collect(),
+            faults: budget_fault.into_iter().chain(interval_fault).collect(),
             clock: Arc::new(SystemClock::new()),
         }
     }
@@ -86,8 +104,11 @@ impl Config {
     }
 
     /// Write a metrics summary this often. [`Duration::ZERO`] turns the summary off.
+    ///
+    /// This outranks [`METRICS_SUMMARY_INTERVAL_VAR`], and it outranks the choice `init`
+    /// would otherwise make from whether the OTLP metrics pipeline is exporting.
     pub fn with_metrics_dump_interval(mut self, interval: Duration) -> Self {
-        self.metrics_dump_interval = interval;
+        self.metrics_dump_interval = IntervalChoice::Code(interval);
         self
     }
 
@@ -136,9 +157,24 @@ impl Config {
         &self.default_filter
     }
 
-    /// How long between metrics summaries.
-    pub fn metrics_dump_interval(&self) -> Duration {
-        self.metrics_dump_interval
+    /// How long between metrics summaries, when anything has chosen.
+    ///
+    /// `None` means nothing chose one, and `init` decides: the summary is off while the
+    /// OTLP metrics pipeline exports the same series, and on when nothing does.
+    pub fn metrics_dump_interval(&self) -> Option<Duration> {
+        match self.metrics_dump_interval {
+            IntervalChoice::Unset => None,
+            IntervalChoice::Variable(interval) | IntervalChoice::Code(interval) => Some(interval),
+        }
+    }
+
+    /// What chose the metrics summary interval, for `init` to report.
+    pub(crate) fn metrics_dump_interval_source(&self) -> Option<&'static str> {
+        match self.metrics_dump_interval {
+            IntervalChoice::Unset => None,
+            IntervalChoice::Variable(_) => Some(METRICS_SUMMARY_INTERVAL_VAR),
+            IntervalChoice::Code(_) => Some("the binary called with_metrics_dump_interval"),
+        }
     }
 
     /// How many distinct label sets one metric may have.
@@ -178,35 +214,62 @@ impl Config {
 /// registry takes a clock: a test cannot set up process-global state without disturbing
 /// another test running beside it.
 fn resolve_shutdown_budget(lookup: impl Fn(&str) -> Option<String>) -> (Duration, Option<String>) {
-    let Some(value) = lookup(SHUTDOWN_BUDGET_VAR)
+    let (budget, fault) = milliseconds_from(SHUTDOWN_BUDGET_VAR, lookup);
+    (budget.unwrap_or(DEFAULT_SHUTDOWN_BUDGET), fault)
+}
+
+/// A duration in whole milliseconds from one variable, or a sentence saying why not.
+///
+/// `None` with no sentence means the variable is unset, which is not a fault: the caller
+/// decides what unset means. `None` with a sentence means the value could not be
+/// honoured, and a value that cannot be honoured is named rather than degraded in
+/// silence.
+fn milliseconds_from(
+    variable: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Option<Duration>, Option<String>) {
+    let Some(value) = lookup(variable)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
-        return (DEFAULT_SHUTDOWN_BUDGET, None);
+        return (None, None);
     };
 
     // Parsed as signed, so a negative value is refused by name rather than failing to
     // parse as unsigned and being reported as though somebody had written a word.
     let Ok(millis) = value.parse::<i64>() else {
         return (
-            DEFAULT_SHUTDOWN_BUDGET,
+            None,
             Some(format!(
-                "{SHUTDOWN_BUDGET_VAR}={value} is not a whole number of milliseconds, so \
-                 it was ignored"
+                "{variable}={value} is not a whole number of milliseconds, so it was \
+                 ignored"
             )),
         );
     };
 
     match u64::try_from(millis) {
-        Ok(millis) => (Duration::from_millis(millis), None),
+        Ok(millis) => (Some(Duration::from_millis(millis)), None),
         Err(_) => (
-            DEFAULT_SHUTDOWN_BUDGET,
-            Some(format!(
-                "{SHUTDOWN_BUDGET_VAR}={value} is negative, so it was ignored. Use 0 to \
-                 stop without flushing at all"
-            )),
+            None,
+            Some(format!("{variable}={value} is negative, so it was ignored")),
         ),
     }
+}
+
+/// What chose the metrics summary interval, before `init` fills the gap.
+///
+/// A separate state for "nothing chose" is the point. Without it the default and a
+/// deliberate ten minutes are the same value, and `init` cannot tell whether it is free
+/// to switch the summary off because the OTLP metrics pipeline already carries the
+/// numbers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntervalChoice {
+    /// Nothing chose one.
+    Unset,
+    /// [`METRICS_SUMMARY_INTERVAL_VAR`] chose it.
+    Variable(Duration),
+    /// The binary chose it in code.
+    Code(Duration),
 }
 
 #[cfg(test)]

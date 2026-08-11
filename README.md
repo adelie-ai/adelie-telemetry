@@ -183,11 +183,38 @@ records a metric depend on opentelemetry whether or not the feature is on.
 Two pieces of state in this crate are process-global, and a test binary runs its tests in
 parallel threads of one process. Both bite the same way.
 
-**The registry.** `metrics::global()` is shared by every test in a binary, so two tests that
-record into it, or that reconfigure it, interfere. Build a `Registry` of your own with
-`Registry::new` and an injected clock; reach for the global only where the facade itself is
-what you are testing, and give that test a binary to itself. Tracked as
-[#6](https://github.com/adelie-ai/adelie-telemetry/issues/6).
+**The registry.** `metrics::global()` is shared by every test in a binary, so two tests
+that record the same instrument interfere and an assertion on an exact count fails about
+half the time. Hold a `TestScope`. It gives the thread a registry of its own, and the
+ordinary facade functions record into that one instead:
+
+```rust
+use adelie_telemetry::metrics::{self, Label, TestScope};
+
+#[test]
+fn a_failed_call_is_counted() {
+    let scope = TestScope::new();
+
+    my_crate::call_the_model();            // records through metrics::increment
+
+    let summary = scope.snapshot();
+    assert_eq!(summary.counters[0].total, 1);
+}
+```
+
+Bind it - `let _ = TestScope::new()` drops it at once and records nothing. Every test doing
+this runs in parallel with every other, and no test needs a mutex or a binary to itself.
+
+`TestScope::with_settings` takes a `Settings` and a clock, so a test can drive a window
+with a `ManualClock` instead of waiting ten minutes, and can exercise the cardinality cap
+at a lower limit.
+
+Two limits worth knowing. A scope covers **the thread that holds it**: code under test
+that records from a thread it spawned itself, or from a multi-threaded async runtime,
+still records into the process registry. A plain `#[test]` and a current-thread
+`#[tokio::test]` both stay on one thread. And a scope does not change the OTLP bridge; a
+measurement taken inside one still reaches whatever meter provider is installed, which in
+a test is the no-op one.
 
 **The environment.** The `OTEL_*` variables are worse. `std::env::set_var` is `unsafe` in
 edition 2024 because `setenv` rewrites a shared array while any other thread may be reading
@@ -217,11 +244,34 @@ histograms in process and writes a summary periodically, so metrics behave the w
 traces already do: local by default, exported additionally. A desktop install running a
 default-feature build from `cargo install` gets real numbers in its journal.
 
-The summary keeps running when a collector *is* configured, and the two paths report over
-the same bucket boundaries, so the local dump cross-checks the exported one.
+**The summary is off while the OTLP metrics pipeline is running.** Those series are
+already exported as metrics, so writing them to the log as well is a second copy of one
+set of numbers in a different signal - from every binary in the fleet, every ten minutes,
+into the same backend. The summary exists for somebody reading a container log with no
+backend attached, which is exactly the case where nothing is exporting metrics.
 
-`Config::with_metrics_dump_interval` sets how often. The default is 10 minutes.
-`Duration::ZERO` turns the summary off; the registry still accumulates.
+Startup says which way it resolved, so an operator who expected a summary and does not see
+one can read the reason rather than guess:
+
+```text
+INFO the metrics summary interval interval_ms=0 reason="the OTLP metrics pipeline exports the same series"
+INFO the metrics summary interval interval_ms=600000 reason="no metrics exporter is configured"
+```
+
+Highest first, the interval comes from:
+
+1. `Config::with_metrics_dump_interval`, for a binary that must have a particular one.
+2. `ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS`, in whole milliseconds. `0` turns the
+   summary off whatever the pipeline is doing. A value that is not a whole number of
+   milliseconds is named at startup and ignored, which leaves the choice where it would
+   have been rather than enabling or disabling anything by accident.
+3. Whether the OTLP metrics pipeline was built: off if it was, ten minutes if it was not.
+
+The registry keeps accumulating either way. Turning the summary off stops the lines, not
+the counting, and the final summary at shutdown goes with them.
+
+Both paths report over the same bucket boundaries, so where both are on the local dump
+cross-checks the exported one.
 
 Each summary reports the window that just closed beside a running total:
 
@@ -393,15 +443,17 @@ such below the table.
 | `OTEL_METRICS_EXPORTER` | `none` switches metrics off. `otlp` is the default and the only other value. |
 | `OTEL_LOGS_EXPORTER` | `none` switches log records off. `otlp` is the default and the only other value. |
 
-One more variable is **not** an `OTEL_*` one, and is deliberately outside that namespace:
+Two more variables are **not** `OTEL_*` ones, and are deliberately outside that namespace:
 
 | Variable | Effect |
 |---|---|
 | `ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS` | How long the guard may spend flushing, in whole milliseconds. `0` means do not wait at all. |
+| `ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS` | How often the in-process metrics summary is written, in whole milliseconds. `0` turns it off. |
 
-It is not exporter configuration. `OTEL_EXPORTER_OTLP_TIMEOUT` is read by the SDK and
-means the per-export timeout, which is a different thing; this is how long the process is
-willing to wait before it stops.
+Neither is exporter configuration. `OTEL_EXPORTER_OTLP_TIMEOUT` is read by the SDK and
+means the per-export timeout, which is a different thing; the first of these is how long
+the process is willing to wait before it stops. The second governs a report this crate
+writes to its own log, which no exporter is involved in at all.
 
 A per-signal variable beats the generic one. The generic endpoint has the signal's path
 appended to it (`/v1/traces` and so on); a per-signal endpoint is used exactly as written,
