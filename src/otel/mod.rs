@@ -246,14 +246,10 @@ impl Pipelines {
             )?;
             let metric_exporter = roots::metrics_exporter("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
                 .map_err(|error| pipeline_error("metrics", &error))?;
-            let mut builder = SdkMeterProvider::builder()
+            let builder = SdkMeterProvider::builder()
                 .with_resource(resource.clone())
-                .with_periodic_exporter(metric_exporter)
-                .with_view(duration_view);
-            for view in config.histogram_views() {
-                builder = builder.with_view(value_view(view.unit, view.boundaries));
-            }
-            Some(builder.build())
+                .with_periodic_exporter(metric_exporter);
+            Some(attach_histogram_views(builder, config).build())
         } else {
             None
         };
@@ -515,6 +511,25 @@ fn value_view(
             .build()
             .ok()
     }
+}
+
+/// Attach the shared duration view and every histogram view `config` declared to a meter
+/// provider builder that is not yet built.
+///
+/// Separated from [`Pipelines::build_from`] so a test can attach these to a builder of its
+/// own - one backed by an in-memory reader rather than a live collector - and prove the
+/// same code the real pipeline runs reaches a real SDK meter provider. A test that
+/// duplicated this loop instead of calling it would pass even if the loop it copied from
+/// were deleted.
+pub(crate) fn attach_histogram_views(
+    builder: opentelemetry_sdk::metrics::MeterProviderBuilder,
+    config: &Config,
+) -> opentelemetry_sdk::metrics::MeterProviderBuilder {
+    let mut builder = builder.with_view(duration_view);
+    for view in config.histogram_views() {
+        builder = builder.with_view(value_view(view.unit, view.boundaries));
+    }
+    builder
 }
 
 /// Exporter construction, and the trust anchors the gRPC transport verifies against.
@@ -834,5 +849,64 @@ mod tests {
 
         assert_eq!(bounds_of("probe.latency"), DURATION_BUCKETS_MS.to_vec());
         assert_eq!(bounds_of("probe.count"), TOKEN_BOUNDARIES.to_vec());
+    }
+
+    /// Named for the review finding on adelie-ai/adelie-telemetry#20: the
+    /// `for view in config.histogram_views()` loop was untested through the public
+    /// `Config` surface - the two tests above build a provider by hand and call
+    /// `value_view` directly, so deleting that loop in `Pipelines::build_from`, or
+    /// hardcoding `DURATION_BUCKETS_MS` in place of `view.boundaries`, left every test
+    /// green. This one drives [`attach_histogram_views`], the exact function
+    /// `Pipelines::build_from` calls, from a real `Config::with_histogram_view`
+    /// registration, with an in-memory reader standing in for the live collector `init`
+    /// would otherwise need.
+    #[cfg(feature = "otel-testing")]
+    #[test]
+    fn config_with_histogram_view_reaches_a_real_meter_provider_through_the_real_attach_path() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        const TOKEN_BOUNDARIES: &[f64] = &[10.0, 20.0, 30.0];
+
+        let config = Config::new("test").with_histogram_view("{token}", TOKEN_BOUNDARIES);
+        let exporter = InMemoryMetricExporter::default();
+        let builder = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build());
+        let provider = attach_histogram_views(builder, &config).build();
+
+        let histogram = crate::metrics::otel_bridge::build_value_histogram(
+            &provider.meter("test"),
+            "gen_ai.client.token.usage",
+            "{token}",
+        );
+        histogram.record(25.0, &[]);
+
+        provider.force_flush().expect("the reader must flush");
+
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("metrics must export");
+        let metric = exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "gen_ai.client.token.usage")
+            .expect("the histogram must be exported");
+        let AggregatedMetrics::F64(MetricData::Histogram(data)) = metric.data() else {
+            panic!("a value histogram must export as an f64 histogram");
+        };
+        let point = data
+            .data_points()
+            .next()
+            .expect("one measurement was recorded");
+
+        assert_eq!(
+            point.bounds().collect::<Vec<f64>>(),
+            TOKEN_BOUNDARIES.to_vec(),
+            "the boundaries registered through Config::with_histogram_view must reach the \
+             exported histogram, via the same attach_histogram_views the real pipeline \
+             calls"
+        );
     }
 }

@@ -203,6 +203,9 @@ struct HistogramSeries {
 #[derive(Clone, Debug)]
 struct ValueHistogramSeries {
     unit: &'static str,
+    /// Kept only to check a later call against, in [`Registry::record_value`] - the
+    /// bucketing itself is already baked into `total`/`window` at construction.
+    boundaries: &'static [f64],
     total: ValueHistogram,
     window: ValueHistogram,
 }
@@ -322,6 +325,13 @@ impl Registry {
     /// with [`crate::Config::with_histogram_view`] at `init`, matching this `unit` - the
     /// registry and the OTLP bridge never talk to each other about bucket boundaries, so
     /// the two are kept in agreement by the call site passing the same constant to both.
+    ///
+    /// A later call that disagrees with the series' first `unit` or `boundaries` is a call
+    /// site bug - two different constants recording under one metric name - and is caught
+    /// by a `debug_assert`, not a panic that would reach a release build: losing this
+    /// measurement's bucket would be wrong, but crashing the process over it in production
+    /// would be worse. The mismatched call still records, into the series the first call
+    /// created, which is what a release build silently does today.
     pub fn record_value(
         &self,
         name: &'static str,
@@ -338,9 +348,24 @@ impl Registry {
                 .entry(key.clone())
                 .or_insert_with(|| ValueHistogramSeries {
                     unit,
+                    boundaries,
                     total: ValueHistogram::new(boundaries),
                     window: ValueHistogram::new(boundaries),
                 });
+            debug_assert_eq!(
+                series.unit, unit,
+                "record_value(\"{name}\", ...) called with unit {unit:?}, but this series \
+                 was first recorded with unit {:?} - every call for one metric name and \
+                 label set must agree on its unit",
+                series.unit
+            );
+            debug_assert_eq!(
+                series.boundaries, boundaries,
+                "record_value(\"{name}\", ...) called with different bucket boundaries \
+                 than this series was first recorded with - every call for one metric \
+                 name and label set must agree, or the in-process histogram and the OTLP \
+                 export disagree about where a measurement falls"
+            );
             series.total.record(value);
             series.window.record(value);
             key

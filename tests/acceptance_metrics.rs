@@ -665,6 +665,29 @@ fn value_histogram_shares_the_cardinality_budget() {
     );
 }
 
+/// Named for the review finding on adelie-ai/adelie-telemetry#20: a series' unit and
+/// boundaries were fixed by whichever call recorded first, guarded only by a doc comment.
+/// A later call for the same metric name and label set that disagrees on `unit` must be
+/// caught in a debug build rather than silently recording under the first call's unit.
+#[test]
+#[should_panic(expected = "unit")]
+fn record_value_panics_in_a_debug_build_when_a_later_call_disagrees_on_unit() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    registry.record_value("metric.mismatched_unit", 1.0, "{token}", &[10.0], &[]);
+    registry.record_value("metric.mismatched_unit", 1.0, "{item}", &[10.0], &[]);
+}
+
+/// The same finding, for `boundaries` rather than `unit`: a later call that disagrees
+/// would otherwise leave the OTLP export and the in-process histogram silently reading two
+/// different bucket sets for what a backend treats as one series.
+#[test]
+#[should_panic(expected = "boundaries")]
+fn record_value_panics_in_a_debug_build_when_a_later_call_disagrees_on_boundaries() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    registry.record_value("metric.mismatched_boundaries", 1.0, "{token}", &[10.0], &[]);
+    registry.record_value("metric.mismatched_boundaries", 1.0, "{token}", &[20.0], &[]);
+}
+
 /// A zero-width joiner is also category Cf and must survive.
 ///
 /// The boundary is deliberate: the fleet strips the bidi controls, not all of Cf. A
