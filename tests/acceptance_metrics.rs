@@ -502,6 +502,192 @@ fn a_bidi_override_cannot_disguise_a_tool_name() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `record_value`: a fixed-bucket histogram generic over unit and boundaries,
+// for a measurement that is not a duration. adelie-ai/adelie-telemetry#19.
+// ---------------------------------------------------------------------------
+
+/// One call to `record_value` produces a value-histogram summary carrying the
+/// unit and the boundaries it was recorded with, distinct from the duration
+/// histograms in `summary.histograms`.
+#[test]
+fn record_value_produces_a_value_histogram_summary_with_its_own_unit() {
+    const BOUNDARIES: &[f64] = &[10.0, 100.0, 1_000.0];
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+
+    registry.record_value(
+        "gen_ai.client.token.usage",
+        42.0,
+        "{token}",
+        BOUNDARIES,
+        &[Label::new("gen_ai.token.type", "input")],
+    );
+
+    let summary = registry.snapshot();
+    assert!(
+        summary.histograms.is_empty(),
+        "a value histogram must not be reported as a duration histogram"
+    );
+    let value_histogram = summary
+        .value_histograms
+        .iter()
+        .find(|histogram| histogram.name == "gen_ai.client.token.usage")
+        .expect("the value histogram must appear in the summary");
+
+    assert_eq!(value_histogram.unit, "{token}");
+    assert_eq!(value_histogram.total.count, 1);
+    assert_eq!(value_histogram.total.sum, 42.0);
+    assert_eq!(value_histogram.window.count, 1);
+}
+
+/// Two value histograms recorded under different bucket sets keep their own
+/// boundaries; recording into one must not reshape the other.
+#[test]
+fn two_value_histograms_keep_their_own_bucket_boundaries() {
+    const NARROW: &[f64] = &[1.0, 2.0];
+    const WIDE: &[f64] = &[1_000.0, 1_000_000.0];
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+
+    registry.record_value("metric.narrow", 1.5, "{unit}", NARROW, &[]);
+    registry.record_value("metric.wide", 500_000.0, "{unit}", WIDE, &[]);
+
+    let summary = registry.snapshot();
+    let narrow = summary
+        .value_histograms
+        .iter()
+        .find(|histogram| histogram.name == "metric.narrow")
+        .expect("the narrow histogram must be present");
+    let wide = summary
+        .value_histograms
+        .iter()
+        .find(|histogram| histogram.name == "metric.wide")
+        .expect("the wide histogram must be present");
+
+    let mut expected_narrow = NARROW.to_vec();
+    expected_narrow.push(f64::INFINITY);
+    let mut expected_wide = WIDE.to_vec();
+    expected_wide.push(f64::INFINITY);
+
+    assert_eq!(narrow.total.bounds(), expected_narrow);
+    assert_eq!(wide.total.bounds(), expected_wide);
+}
+
+/// A value lands in the bucket whose upper bound it does not exceed, exactly
+/// like the duration histogram - this is the mechanism the token histogram's
+/// "over 25000" report depends on.
+#[test]
+fn value_histogram_places_a_measurement_at_its_exact_boundary() {
+    const BOUNDARIES: &[f64] = &[0.0, 64.0, 25_000.0, 32_768.0];
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+
+    registry.record_value(
+        "gen_ai.client.token.usage",
+        25_000.0,
+        "{token}",
+        BOUNDARIES,
+        &[],
+    );
+    registry.record_value(
+        "gen_ai.client.token.usage",
+        25_001.0,
+        "{token}",
+        BOUNDARIES,
+        &[],
+    );
+
+    let summary = registry.snapshot();
+    let snapshot = &summary
+        .value_histograms
+        .iter()
+        .find(|histogram| histogram.name == "gen_ai.client.token.usage")
+        .expect("the histogram must be present")
+        .total;
+
+    let at_boundary = snapshot
+        .buckets
+        .iter()
+        .find(|bucket| bucket.upper_bound == 25_000.0)
+        .expect("25000 must be one of the bucket boundaries");
+    assert_eq!(
+        at_boundary.count, 1,
+        "a value equal to the boundary belongs in that bucket, not the next one"
+    );
+
+    let next = snapshot
+        .buckets
+        .iter()
+        .find(|bucket| bucket.upper_bound == 32_768.0)
+        .expect("32768 must be the next boundary");
+    assert_eq!(
+        next.count, 1,
+        "a value one over the boundary belongs in the next bucket"
+    );
+}
+
+/// A value histogram with nothing recorded reports nothing, the same rule the
+/// duration histogram already holds to.
+#[test]
+fn value_histogram_reports_nothing_when_empty() {
+    let (registry, clock) = registry(Duration::from_secs(60), 64);
+    clock.advance(Duration::from_secs(60));
+
+    let summary = registry.dump_if_due().expect("the window is due");
+    assert!(summary.is_empty());
+    assert!(summary.value_histograms.is_empty());
+}
+
+/// A value-histogram series shares the cardinality budget with counters and
+/// duration histograms under the same metric name, the same rule
+/// `cardinality_cap_counts_a_label_set_once_across_instruments` already holds
+/// duration histograms to.
+#[test]
+fn value_histogram_shares_the_cardinality_budget() {
+    let cap = 2;
+    let (registry, _clock) = registry(Duration::from_secs(600), cap);
+    const BOUNDARIES: &[f64] = &[10.0];
+
+    for index in 0..cap {
+        let labels = [Label::new("model", format!("model-{index}"))];
+        registry.increment("llm.requests", &labels);
+        registry.record_value(
+            "gen_ai.client.token.usage",
+            1.0,
+            "{token}",
+            BOUNDARIES,
+            &labels,
+        );
+    }
+
+    assert_eq!(
+        registry.series_count(),
+        cap * 2,
+        "each of the {cap} label sets holds one counter series and one value-histogram series"
+    );
+}
+
+/// Named for the review finding on adelie-ai/adelie-telemetry#20: a series' unit and
+/// boundaries were fixed by whichever call recorded first, guarded only by a doc comment.
+/// A later call for the same metric name and label set that disagrees on `unit` must be
+/// caught in a debug build rather than silently recording under the first call's unit.
+#[test]
+#[should_panic(expected = "unit")]
+fn record_value_panics_in_a_debug_build_when_a_later_call_disagrees_on_unit() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    registry.record_value("metric.mismatched_unit", 1.0, "{token}", &[10.0], &[]);
+    registry.record_value("metric.mismatched_unit", 1.0, "{item}", &[10.0], &[]);
+}
+
+/// The same finding, for `boundaries` rather than `unit`: a later call that disagrees
+/// would otherwise leave the OTLP export and the in-process histogram silently reading two
+/// different bucket sets for what a backend treats as one series.
+#[test]
+#[should_panic(expected = "boundaries")]
+fn record_value_panics_in_a_debug_build_when_a_later_call_disagrees_on_boundaries() {
+    let (registry, _clock) = registry(Duration::from_secs(600), 64);
+    registry.record_value("metric.mismatched_boundaries", 1.0, "{token}", &[10.0], &[]);
+    registry.record_value("metric.mismatched_boundaries", 1.0, "{token}", &[20.0], &[]);
+}
+
 /// A zero-width joiner is also category Cf and must survive.
 ///
 /// The boundary is deliberate: the fleet strips the bidi controls, not all of Cf. A

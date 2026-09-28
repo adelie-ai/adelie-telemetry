@@ -292,6 +292,46 @@ Durations go into fixed-bucket histograms, from 1 ms to 5 minutes. A mean hides 
 mean, and only the second one is the report a user files. The same boundaries feed the OTLP
 view, so both paths agree about which bucket a measurement fell in.
 
+### Value histograms - a measurement that is not a duration
+
+`record_duration` always measures a `Duration`, in milliseconds, over the shared duration
+buckets above. A different measurement - a per-request token count, a queue depth - needs
+its own unit and its own bucket boundaries. `record_value` is the same fixed-bucket shape,
+generic over both:
+
+```rust
+use adelie_telemetry::metrics::{self, Label};
+
+const TOKEN_BUCKETS: &[f64] = &[0.0, 1_024.0, 8_192.0, 25_000.0, 100_000.0, 1_048_576.0];
+
+metrics::record_value(
+    "gen_ai.client.token.usage",
+    input_tokens as f64,
+    "{token}",
+    TOKEN_BUCKETS,
+    &[Label::new("gen_ai.token.type", "input")],
+);
+```
+
+`Registry::snapshot()` reports these in `value_histograms`, alongside the existing counters
+and duration histograms, each carrying the unit it was recorded under.
+
+The boundaries above shape the in-process registry on their own - nothing further is
+needed for the local dump to use them. The OTLP export is a separate step, because a
+bucket boundary is a property of the `SdkMeterProvider`'s `View`s, fixed once at `init`:
+register the same boundaries there, keyed by the same unit, or the exported histogram
+falls back to the SDK's defaults while the local dump uses yours.
+
+```rust
+let config = adelie_telemetry::Config::new("my-binary")
+    .with_histogram_view("{token}", TOKEN_BUCKETS);
+```
+
+One call per unit a binary records `record_value` under. This crate still owns no domain
+vocabulary (see "What it refuses" above): it ships no unit and no boundaries of its own
+for anything but the shared duration histogram, so a binary that wants its OTLP export to
+agree with its local dump has to say so once, at `init`.
+
 ### Cardinality
 
 One metric may have 64 distinct label sets by default. Past that, further label sets fold

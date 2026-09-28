@@ -72,7 +72,7 @@ use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-pub use config::{Config, DEFAULT_FILTER};
+pub use config::{Config, DEFAULT_FILTER, HistogramView};
 pub use guard::Guard;
 pub use safe::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES, REPLACEMENT, Safe, TRUNCATED};
 pub use trace_context::{
