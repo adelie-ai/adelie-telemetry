@@ -580,8 +580,20 @@ fn value_histogram_places_a_measurement_at_its_exact_boundary() {
     const BOUNDARIES: &[f64] = &[0.0, 64.0, 25_000.0, 32_768.0];
     let (registry, _clock) = registry(Duration::from_secs(600), 64);
 
-    registry.record_value("gen_ai.client.token.usage", 25_000.0, "{token}", BOUNDARIES, &[]);
-    registry.record_value("gen_ai.client.token.usage", 25_001.0, "{token}", BOUNDARIES, &[]);
+    registry.record_value(
+        "gen_ai.client.token.usage",
+        25_000.0,
+        "{token}",
+        BOUNDARIES,
+        &[],
+    );
+    registry.record_value(
+        "gen_ai.client.token.usage",
+        25_001.0,
+        "{token}",
+        BOUNDARIES,
+        &[],
+    );
 
     let summary = registry.snapshot();
     let snapshot = &summary
@@ -637,7 +649,13 @@ fn value_histogram_shares_the_cardinality_budget() {
     for index in 0..cap {
         let labels = [Label::new("model", format!("model-{index}"))];
         registry.increment("llm.requests", &labels);
-        registry.record_value("gen_ai.client.token.usage", 1.0, "{token}", BOUNDARIES, &labels);
+        registry.record_value(
+            "gen_ai.client.token.usage",
+            1.0,
+            "{token}",
+            BOUNDARIES,
+            &labels,
+        );
     }
 
     assert_eq!(

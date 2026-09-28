@@ -143,3 +143,133 @@ impl Histogram {
         self.sum_ms = 0.0;
     }
 }
+
+// ---------------------------------------------------------------------------
+// A fixed-bucket histogram generic over unit and boundaries, for a
+// measurement that is not a duration - a per-request token count, for
+// example. [`Histogram`] above stays duration-only, unchanged in name and
+// shape: several consumer repos already depend on it, `HistogramSnapshot`
+// and `quantile_ms` included. This is the same bucketing algorithm, kept as
+// a separate type rather than a generalization of that one, so nothing that
+// builds only against the duration path sees any change at all.
+// ---------------------------------------------------------------------------
+
+/// One bucket of a [`ValueHistogram`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ValueBucket {
+    /// The inclusive upper bound of this bucket. The overflow bucket reports
+    /// [`f64::INFINITY`].
+    pub upper_bound: f64,
+    /// How many measurements fell at or below the bound and above the one before it.
+    pub count: u64,
+}
+
+/// A [`ValueHistogram`] as it stood at one moment.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ValueHistogramSnapshot {
+    /// How many measurements the histogram holds.
+    pub count: u64,
+    /// The sum of every measurement, in the metric's own unit.
+    pub sum: f64,
+    /// Every bucket, in ascending bound order, ending with the overflow bucket.
+    pub buckets: Vec<ValueBucket>,
+}
+
+impl ValueHistogramSnapshot {
+    /// The bucket boundaries this snapshot was built with, overflow bucket included.
+    pub fn bounds(&self) -> Vec<f64> {
+        self.buckets
+            .iter()
+            .map(|bucket| bucket.upper_bound)
+            .collect()
+    }
+
+    /// The upper bound of the bucket the given quantile falls in.
+    ///
+    /// A bucketed histogram cannot give an exact quantile, only the bucket that contains
+    /// it. Reporting the bound is honest about that. Returns `None` when nothing has been
+    /// recorded.
+    pub fn quantile(&self, quantile: f64) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        let quantile = quantile.clamp(0.0, 1.0);
+        let target = (quantile * self.count as f64).ceil().max(1.0) as u64;
+
+        let mut seen = 0;
+        for bucket in &self.buckets {
+            seen += bucket.count;
+            if seen >= target {
+                return Some(bucket.upper_bound);
+            }
+        }
+        self.buckets.last().map(|bucket| bucket.upper_bound)
+    }
+
+    /// The arithmetic mean, or `None` when nothing has been recorded.
+    pub fn mean(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.sum / self.count as f64)
+    }
+}
+
+/// A histogram with fixed bucket boundaries, over a value in the caller's own unit.
+#[derive(Clone, Debug)]
+pub(crate) struct ValueHistogram {
+    bounds: &'static [f64],
+    counts: Vec<u64>,
+    count: u64,
+    sum: f64,
+}
+
+impl ValueHistogram {
+    /// An empty histogram over the given boundaries.
+    pub(crate) fn new(bounds: &'static [f64]) -> Self {
+        Self {
+            bounds,
+            counts: vec![0; bounds.len() + 1],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+
+    /// Add one measurement.
+    pub(crate) fn record(&mut self, value: f64) {
+        let index = self
+            .bounds
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(self.bounds.len());
+        self.counts[index] += 1;
+        self.count += 1;
+        self.sum += value;
+    }
+
+    /// This histogram as a snapshot, leaving it unchanged.
+    pub(crate) fn snapshot(&self) -> ValueHistogramSnapshot {
+        let buckets = self
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| ValueBucket {
+                upper_bound: self.bounds.get(index).copied().unwrap_or(f64::INFINITY),
+                count: *count,
+            })
+            .collect();
+
+        ValueHistogramSnapshot {
+            count: self.count,
+            sum: self.sum,
+            buckets,
+        }
+    }
+
+    /// Forget every measurement, keeping the boundaries.
+    pub(crate) fn reset(&mut self) {
+        self.counts.iter_mut().for_each(|count| *count = 0);
+        self.count = 0;
+        self.sum = 0.0;
+    }
+}

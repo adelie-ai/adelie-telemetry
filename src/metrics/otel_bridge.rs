@@ -58,25 +58,39 @@ pub(crate) fn add(name: &'static str, value: u64, labels: &[Label]) {
 
 /// Record a duration, in milliseconds, into the OTLP histogram of this name.
 pub(crate) fn record_duration_ms(name: &'static str, millis: f64, labels: &[Label]) {
+    record_value(name, millis, DURATION_UNIT, labels);
+}
+
+/// Record one measurement into the OTLP histogram of this name, built with this unit.
+///
+/// Shares the instrument cache with the duration path: a metric name is either a duration
+/// histogram or a value histogram for the life of the process, never both, so caching by
+/// name alone cannot confuse the two. The boundaries a caller wants for `unit` are applied
+/// by a `View` registered at meter-provider construction
+/// ([`crate::Config::with_histogram_view`]), not by anything here - an instrument built
+/// through this function reports the SDK's default buckets until one is registered for its
+/// unit.
+pub(crate) fn record_value(name: &'static str, value: f64, unit: &'static str, labels: &[Label]) {
     let attributes = attributes(labels);
     let mut cache = lock(histograms());
     let histogram = cache
         .entry(name)
-        .or_insert_with(|| build_duration_histogram(&meter(), name));
-    histogram.record(millis, &attributes);
+        .or_insert_with(|| build_value_histogram(&meter(), name, unit));
+    histogram.record(value, &attributes);
 }
 
-/// Build a duration histogram the OTLP view will select.
+/// Build a histogram over the given unit, for a `View` matching that unit to select.
 ///
-/// The view matches on instrument kind and unit, so the unit set here is what attaches
-/// the shared bucket boundaries. Every duration histogram is built through this one
+/// Every histogram this bridge creates - duration or value - is built through this one
 /// function, and a test builds its instrument the same way, so dropping the unit fails
-/// that test instead of silently moving every histogram onto the SDK's default buckets.
-pub(crate) fn build_duration_histogram(
+/// that test instead of silently moving a histogram onto the SDK's default buckets. A
+/// duration histogram is `build_value_histogram(meter, name, DURATION_UNIT)`.
+pub(crate) fn build_value_histogram(
     meter: &opentelemetry::metrics::Meter,
     name: &'static str,
+    unit: &'static str,
 ) -> Histogram<f64> {
-    meter.f64_histogram(name).with_unit(DURATION_UNIT).build()
+    meter.f64_histogram(name).with_unit(unit).build()
 }
 
 fn meter() -> opentelemetry::metrics::Meter {

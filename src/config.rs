@@ -40,6 +40,22 @@ pub const SHUTDOWN_BUDGET_VAR: &str = "ADELIE_TELEMETRY_SHUTDOWN_BUDGET_MS";
 /// [`Config::with_metrics_dump_interval`] outranks it.
 pub const METRICS_SUMMARY_INTERVAL_VAR: &str = "ADELIE_TELEMETRY_METRICS_SUMMARY_INTERVAL_MS";
 
+/// A histogram unit, and the explicit bucket boundaries the OTLP export uses for it.
+///
+/// This crate owns no domain vocabulary (see the crate doc), so it cannot decide what
+/// boundaries suit a binary's own value histograms - a token count and a queue depth want
+/// very different buckets. A binary declares the pair once, with
+/// [`Config::with_histogram_view`], and every `metrics::record_value` call recorded under
+/// that unit reports through it.
+#[derive(Clone, Copy, Debug)]
+pub struct HistogramView {
+    /// The unit this view applies to, exactly as passed to `metrics::record_value`.
+    pub unit: &'static str,
+    /// The bucket boundaries, ascending, with no `f64::INFINITY` - the SDK adds the
+    /// overflow bucket implicitly, the same way the shared duration boundaries do.
+    pub boundaries: &'static [f64],
+}
+
 /// How a binary configures its telemetry.
 ///
 /// Everything past the service name has a working default, so the common case is
@@ -54,6 +70,7 @@ pub struct Config {
     cardinality_cap: usize,
     span_close_events: bool,
     shutdown_budget: Duration,
+    histogram_views: Vec<HistogramView>,
     /// What the environment asked for and could not have.
     ///
     /// Collected here rather than written where it is found, because `Config::new` runs
@@ -90,6 +107,7 @@ impl Config {
             cardinality_cap: DEFAULT_CARDINALITY_CAP,
             span_close_events: false,
             shutdown_budget,
+            histogram_views: Vec::new(),
             faults: budget_fault.into_iter().chain(interval_fault).collect(),
             clock: Arc::new(SystemClock::new()),
         }
@@ -145,6 +163,27 @@ impl Config {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Give every `metrics::record_value` histogram recorded under `unit` these bucket
+    /// boundaries in the OTLP export.
+    ///
+    /// Call once per unit a binary records `metrics::record_value` under. A second call
+    /// for the same unit adds a second view rather than replacing the first; the OTLP SDK
+    /// resolves that by taking whichever view matches first, so register each unit once.
+    ///
+    /// This has no effect on the in-process registry, which already takes its boundaries
+    /// from the `boundaries` argument of `metrics::record_value` itself - this only tells
+    /// the OTLP exporter to agree with it.
+    pub fn with_histogram_view(mut self, unit: &'static str, boundaries: &'static [f64]) -> Self {
+        self.histogram_views
+            .push(HistogramView { unit, boundaries });
+        self
+    }
+
+    /// The histogram views this binary registered.
+    pub fn histogram_views(&self) -> &[HistogramView] {
+        &self.histogram_views
     }
 
     /// The service name this binary reports.
@@ -369,5 +408,32 @@ mod tests {
         let config = Config::new("test").with_shutdown_budget(Duration::from_millis(120));
 
         assert_eq!(config.shutdown_budget(), Duration::from_millis(120));
+    }
+
+    /// A binary with no value histograms registers none, and gets no views at all - the
+    /// duration view is still built unconditionally by `otel::Pipelines::build_from`.
+    #[test]
+    fn a_fresh_config_registers_no_histogram_views() {
+        let config = Config::new("test");
+        assert!(config.histogram_views().is_empty());
+    }
+
+    /// Each `with_histogram_view` call is kept, in the order it was made, so a binary that
+    /// records more than one non-duration histogram gets a view per unit.
+    #[test]
+    fn histogram_views_are_kept_in_registration_order() {
+        const TOKEN_BOUNDARIES: &[f64] = &[64.0, 25_000.0];
+        const QUEUE_BOUNDARIES: &[f64] = &[1.0, 10.0, 100.0];
+
+        let config = Config::new("test")
+            .with_histogram_view("{token}", TOKEN_BOUNDARIES)
+            .with_histogram_view("{item}", QUEUE_BOUNDARIES);
+
+        let views = config.histogram_views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].unit, "{token}");
+        assert_eq!(views[0].boundaries, TOKEN_BOUNDARIES);
+        assert_eq!(views[1].unit, "{item}");
+        assert_eq!(views[1].boundaries, QUEUE_BOUNDARIES);
     }
 }

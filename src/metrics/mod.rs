@@ -34,13 +34,16 @@ use std::time::Duration;
 
 use crate::clock::{Clock, SystemClock};
 
-pub use histogram::{Bucket, DURATION_BUCKETS_MS, HistogramSnapshot};
+pub use histogram::{
+    Bucket, DURATION_BUCKETS_MS, HistogramSnapshot, ValueBucket, ValueHistogramSnapshot,
+};
 /// Used by the OTLP failure report, which is only compiled with the feature on.
 #[cfg(feature = "otel")]
 pub(crate) use registry::sanitize;
 pub use registry::{
     CounterSummary, DEFAULT_CARDINALITY_CAP, DEFAULT_DUMP_INTERVAL, HistogramSummary, Label,
     MAX_LABEL_VALUE_BYTES, OVERFLOW_LABEL_KEY, OVERFLOW_LABEL_VALUE, Registry, Settings, Summary,
+    ValueHistogramSummary,
 };
 
 /// The registry the free functions in this module record into.
@@ -94,6 +97,25 @@ pub fn record_duration(name: &'static str, value: Duration, labels: &[Label]) {
     match scoped() {
         Some(registry) => registry.record_duration(name, value, labels),
         None => global().record_duration(name, value, labels),
+    }
+}
+
+/// Record one measurement into a fixed-bucket histogram over a value that is not a
+/// duration - a per-request token count, for example.
+///
+/// `unit` and `boundaries` are read on the series' first measurement, so every call site
+/// for one metric name must pass the same pair; see [`Registry::record_value`] for how the
+/// OTLP export picks the boundaries up.
+pub fn record_value(
+    name: &'static str,
+    value: f64,
+    unit: &'static str,
+    boundaries: &'static [f64],
+    labels: &[Label],
+) {
+    match scoped() {
+        Some(registry) => registry.record_value(name, value, unit, boundaries, labels),
+        None => global().record_value(name, value, unit, boundaries, labels),
     }
 }
 

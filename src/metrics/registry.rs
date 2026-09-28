@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::clock::Clock;
-use crate::metrics::histogram::{DURATION_BUCKETS_MS, Histogram, HistogramSnapshot};
+use crate::metrics::histogram::{
+    DURATION_BUCKETS_MS, Histogram, HistogramSnapshot, ValueHistogram, ValueHistogramSnapshot,
+};
 
 /// How many distinct label sets one metric may have before the rest are folded together.
 ///
@@ -118,6 +120,22 @@ pub struct HistogramSummary {
     pub total: HistogramSnapshot,
 }
 
+/// One value histogram, as of a dump - a fixed-bucket histogram over a measurement that is
+/// not a duration, recorded through [`Registry::record_value`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct ValueHistogramSummary {
+    /// The metric name the call site used.
+    pub name: &'static str,
+    /// The label set, sorted by key.
+    pub labels: Vec<Label>,
+    /// The unit this metric was recorded in, exactly as the call site passed it.
+    pub unit: &'static str,
+    /// Only the measurements taken during the window that just closed.
+    pub window: ValueHistogramSnapshot,
+    /// Every measurement taken over the whole life of the process.
+    pub total: ValueHistogramSnapshot,
+}
+
 /// Everything the registry holds at one moment.
 ///
 /// Why both a window and a total: on a pod that has run for a month, a cumulative number
@@ -134,12 +152,14 @@ pub struct Summary {
     pub counters: Vec<CounterSummary>,
     /// Every duration histogram, sorted by name and then by label set.
     pub histograms: Vec<HistogramSummary>,
+    /// Every value histogram, sorted by name and then by label set.
+    pub value_histograms: Vec<ValueHistogramSummary>,
 }
 
 impl Summary {
     /// Whether anything at all has been recorded.
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty() && self.histograms.is_empty()
+        self.counters.is_empty() && self.histograms.is_empty() && self.value_histograms.is_empty()
     }
 }
 
@@ -157,6 +177,7 @@ struct Inner {
     last_dump_at: Duration,
     counters: HashMap<SeriesKey, CounterSeries>,
     histograms: HashMap<SeriesKey, HistogramSeries>,
+    value_histograms: HashMap<SeriesKey, ValueHistogramSeries>,
     /// How many distinct label sets each metric name has, so the cap is per metric.
     label_sets: HashMap<&'static str, usize>,
 }
@@ -179,6 +200,13 @@ struct HistogramSeries {
     window: Histogram,
 }
 
+#[derive(Clone, Debug)]
+struct ValueHistogramSeries {
+    unit: &'static str,
+    total: ValueHistogram,
+    window: ValueHistogram,
+}
+
 impl Registry {
     /// An empty registry.
     pub fn new(settings: Settings, clock: Arc<dyn Clock>) -> Self {
@@ -191,6 +219,7 @@ impl Registry {
                 last_dump_at: started_at,
                 counters: HashMap::new(),
                 histograms: HashMap::new(),
+                value_histograms: HashMap::new(),
                 label_sets: HashMap::new(),
             }),
         }
@@ -218,6 +247,9 @@ impl Registry {
             series.window = 0;
         }
         for series in inner.histograms.values_mut() {
+            series.window.reset();
+        }
+        for series in inner.value_histograms.values_mut() {
             series.window.reset();
         }
     }
@@ -281,6 +313,45 @@ impl Registry {
         let _ = resolved;
     }
 
+    /// Record one measurement into a fixed-bucket histogram over a value that is not a
+    /// duration.
+    ///
+    /// `unit` and `boundaries` are read on the series' first measurement; every later call
+    /// for the same name and label set records into the histogram that call created. A
+    /// binary that wants the OTLP export to use `boundaries` as well registers them once
+    /// with [`crate::Config::with_histogram_view`] at `init`, matching this `unit` - the
+    /// registry and the OTLP bridge never talk to each other about bucket boundaries, so
+    /// the two are kept in agreement by the call site passing the same constant to both.
+    pub fn record_value(
+        &self,
+        name: &'static str,
+        value: f64,
+        unit: &'static str,
+        boundaries: &'static [f64],
+        labels: &[Label],
+    ) {
+        let resolved = {
+            let mut inner = self.lock();
+            let key = inner.key_for(name, labels);
+            let series = inner
+                .value_histograms
+                .entry(key.clone())
+                .or_insert_with(|| ValueHistogramSeries {
+                    unit,
+                    total: ValueHistogram::new(boundaries),
+                    window: ValueHistogram::new(boundaries),
+                });
+            series.total.record(value);
+            series.window.record(value);
+            key
+        };
+
+        #[cfg(feature = "otel")]
+        crate::metrics::otel_bridge::record_value(resolved.name, value, unit, &resolved.labels);
+        #[cfg(not(feature = "otel"))]
+        let _ = resolved;
+    }
+
     /// Everything recorded so far, leaving the window open.
     pub fn snapshot(&self) -> Summary {
         self.lock().summarize()
@@ -289,7 +360,7 @@ impl Registry {
     /// How many distinct series the registry holds, counters and histograms together.
     pub fn series_count(&self) -> usize {
         let inner = self.lock();
-        inner.counters.len() + inner.histograms.len()
+        inner.counters.len() + inner.histograms.len() + inner.value_histograms.len()
     }
 
     /// A summary if one is due, closing the window and starting a new one.
@@ -346,6 +417,7 @@ pub(crate) fn emit(summary: &Summary) {
         uptime_seconds = summary.uptime.as_secs(),
         counters = summary.counters.len(),
         histograms = summary.histograms.len(),
+        value_histograms = summary.value_histograms.len(),
         "metrics summary"
     );
 
@@ -369,6 +441,20 @@ pub(crate) fn emit(summary: &Summary) {
             total_count = histogram.total.count,
             total_p95_ms = histogram.total.quantile_ms(0.95),
             "duration"
+        );
+    }
+
+    for histogram in &summary.value_histograms {
+        tracing::info!(
+            metric = histogram.name,
+            labels = %render_labels(&histogram.labels),
+            unit = histogram.unit,
+            window_count = histogram.window.count,
+            window_p50 = histogram.window.quantile(0.50),
+            window_p95 = histogram.window.quantile(0.95),
+            total_count = histogram.total.count,
+            total_p95 = histogram.total.quantile(0.95),
+            "value"
         );
     }
 }
@@ -435,11 +521,12 @@ impl Inner {
             labels: sorted,
         };
 
-        // Checked against both maps, not just this instrument's. The budget is per metric
-        // name, so a label set used as a counter and as a histogram is one label set and
-        // must cost one slot.
-        let known =
-            self.counters.contains_key(&candidate) || self.histograms.contains_key(&candidate);
+        // Checked against every map, not just this instrument's. The budget is per metric
+        // name, so a label set used as a counter, a duration histogram or a value
+        // histogram is one label set and must cost one slot.
+        let known = self.counters.contains_key(&candidate)
+            || self.histograms.contains_key(&candidate)
+            || self.value_histograms.contains_key(&candidate);
         if known {
             return candidate;
         }
@@ -462,6 +549,9 @@ impl Inner {
             series.window = 0;
         }
         for series in self.histograms.values_mut() {
+            series.window.reset();
+        }
+        for series in self.value_histograms.values_mut() {
             series.window.reset();
         }
         self.last_dump_at = self.clock.now();
@@ -503,11 +593,29 @@ impl Inner {
                 .then_with(|| left.labels.cmp(&right.labels))
         });
 
+        let mut value_histograms: Vec<ValueHistogramSummary> = self
+            .value_histograms
+            .iter()
+            .map(|(key, series)| ValueHistogramSummary {
+                name: key.name,
+                labels: key.labels.clone(),
+                unit: series.unit,
+                window: series.window.snapshot(),
+                total: series.total.snapshot(),
+            })
+            .collect();
+        value_histograms.sort_by(|left, right| {
+            left.name
+                .cmp(right.name)
+                .then_with(|| left.labels.cmp(&right.labels))
+        });
+
         Summary {
             window: now.saturating_sub(self.last_dump_at),
             uptime: now.saturating_sub(self.started_at),
             counters,
             histograms,
+            value_histograms,
         }
     }
 }

@@ -246,13 +246,14 @@ impl Pipelines {
             )?;
             let metric_exporter = roots::metrics_exporter("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
                 .map_err(|error| pipeline_error("metrics", &error))?;
-            Some(
-                SdkMeterProvider::builder()
-                    .with_resource(resource.clone())
-                    .with_periodic_exporter(metric_exporter)
-                    .with_view(duration_view)
-                    .build(),
-            )
+            let mut builder = SdkMeterProvider::builder()
+                .with_resource(resource.clone())
+                .with_periodic_exporter(metric_exporter)
+                .with_view(duration_view);
+            for view in config.histogram_views() {
+                builder = builder.with_view(value_view(view.unit, view.boundaries));
+            }
+            Some(builder.build())
         } else {
             None
         };
@@ -491,6 +492,31 @@ pub(crate) fn build_duration_stream() -> Result<Stream, Box<dyn std::error::Erro
         .build()
 }
 
+/// The view that gives a value histogram recorded under `unit` its registered bucket
+/// boundaries.
+///
+/// One of these is added per [`crate::HistogramView`] a binary declared with
+/// [`crate::Config::with_histogram_view`]. It matches like [`duration_view`] does - kind
+/// and unit, never name - so a binary that records more than one histogram under the same
+/// unit shares this view, and one recorded under a different unit needs its own.
+fn value_view(
+    unit: &'static str,
+    boundaries: &'static [f64],
+) -> impl Fn(&Instrument) -> Option<Stream> + Send + Sync + 'static {
+    move |instrument: &Instrument| {
+        if instrument.kind() != InstrumentKind::Histogram || instrument.unit() != unit {
+            return None;
+        }
+        Stream::builder()
+            .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                boundaries: boundaries.to_vec(),
+                record_min_max: true,
+            })
+            .build()
+            .ok()
+    }
+}
+
 /// Exporter construction, and the trust anchors the gRPC transport verifies against.
 ///
 /// The gRPC transport needs its roots passed in explicitly, and that is not obvious.
@@ -626,9 +652,10 @@ mod tests {
 
         // Built through the same function the facade builds its instruments with, so the
         // test sees whatever the bridge would really produce.
-        let histogram = crate::metrics::otel_bridge::build_duration_histogram(
+        let histogram = crate::metrics::otel_bridge::build_value_histogram(
             &provider.meter("test"),
             "probe.latency",
+            crate::metrics::otel_bridge::DURATION_UNIT,
         );
         histogram.record(320.0, &[KeyValue::new("provider", "example")]);
 
@@ -692,5 +719,120 @@ mod tests {
             "ms",
             "the view matches on this unit; changing it detaches the shared boundaries"
         );
+    }
+
+    /// A `Config::with_histogram_view` registration reaches the OTLP export: a
+    /// `record_value` call under that unit reports the declared boundaries, read back off
+    /// a real export rather than compared against the constant the view was built from.
+    ///
+    /// This is the acceptance criterion from adelie-ai/adelie-telemetry#19.
+    #[cfg(feature = "otel-testing")]
+    #[test]
+    fn a_registered_histogram_view_reaches_the_otlp_export() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        const TOKEN_BOUNDARIES: &[f64] = &[0.0, 64.0, 25_000.0, 1_048_576.0];
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(value_view("{token}", TOKEN_BOUNDARIES))
+            .build();
+
+        let histogram = crate::metrics::otel_bridge::build_value_histogram(
+            &provider.meter("test"),
+            "gen_ai.client.token.usage",
+            "{token}",
+        );
+        histogram.record(30_000.0, &[]);
+
+        provider.force_flush().expect("the reader must flush");
+
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("metrics must export");
+        let histogram = exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "gen_ai.client.token.usage")
+            .expect("the value histogram must be exported");
+
+        let AggregatedMetrics::F64(MetricData::Histogram(data)) = histogram.data() else {
+            panic!("a value histogram must export as an f64 histogram");
+        };
+        let point = data
+            .data_points()
+            .next()
+            .expect("one measurement was recorded");
+
+        assert_eq!(
+            point.bounds().collect::<Vec<f64>>(),
+            TOKEN_BOUNDARIES.to_vec(),
+            "the OTLP export must use the boundaries registered for this unit"
+        );
+        assert_eq!(point.count(), 1);
+    }
+
+    /// Two views for two different units, registered on the same provider, must not cross
+    /// boundaries: a duration histogram keeps the shared duration buckets and a value
+    /// histogram under a different unit keeps its own, even though both are the same
+    /// `InstrumentKind::Histogram`.
+    #[cfg(feature = "otel-testing")]
+    #[test]
+    fn two_histogram_views_for_two_units_do_not_cross_boundaries() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        const TOKEN_BOUNDARIES: &[f64] = &[1.0, 2.0, 3.0];
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(duration_view)
+            .with_view(value_view("{token}", TOKEN_BOUNDARIES))
+            .build();
+
+        let duration_histogram = crate::metrics::otel_bridge::build_value_histogram(
+            &provider.meter("test"),
+            "probe.latency",
+            crate::metrics::otel_bridge::DURATION_UNIT,
+        );
+        duration_histogram.record(10.0, &[]);
+
+        let value_histogram = crate::metrics::otel_bridge::build_value_histogram(
+            &provider.meter("test"),
+            "probe.count",
+            "{token}",
+        );
+        value_histogram.record(1.5, &[]);
+
+        provider.force_flush().expect("the reader must flush");
+
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("metrics must export");
+        let bounds_of = |name: &str| -> Vec<f64> {
+            let metric = exported
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .find(|metric| metric.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be exported"));
+            let AggregatedMetrics::F64(MetricData::Histogram(data)) = metric.data() else {
+                panic!("{name} must export as an f64 histogram");
+            };
+            data.data_points()
+                .next()
+                .expect("one measurement was recorded")
+                .bounds()
+                .collect()
+        };
+
+        assert_eq!(bounds_of("probe.latency"), DURATION_BUCKETS_MS.to_vec());
+        assert_eq!(bounds_of("probe.count"), TOKEN_BOUNDARIES.to_vec());
     }
 }
